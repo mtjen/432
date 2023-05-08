@@ -1,0 +1,183 @@
+---
+title: "432: Lab 06"
+author: "Max Tjen"
+date: last-modified
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-overflow: wrap
+    embed-resources: true
+    date-format: iso
+    theme: default
+---
+
+## R Packages and Setup
+
+```{r}
+#| message: false
+#| warning: false
+
+knitr::opts_chunk$set(comment = NA) 
+
+library(janitor) 
+library(survival)
+library(survminer)
+library(kableExtra)
+library(yardstick)
+library(tidyverse) 
+
+theme_set(theme_bw())
+```
+
+
+# Question 1
+
+```{r}
+# load and filter data
+rem_data <- read_csv("/Users/mtjen/Desktop/432/labs/lab06/remission.csv", 
+                show_col_types = FALSE) |>
+  mutate(censored = 1 - censored)           # make it so 0 is if a subject is censored
+
+# survival estimates
+survival <- Surv(time = rem_data$time, event = rem_data$censored)
+
+# kaplan meier
+km_obj <- survfit(survival ~ rem_data$treatment)
+
+# estimated survival function
+print(km_obj, print.rmean = TRUE)
+
+# plot
+ggsurvplot(km_obj, 
+           data = rem_data,
+           conf.int = TRUE,
+           risk.table = TRUE,
+           risk.table.height = 0.25,
+           pval = TRUE,
+           xlab = "Time (days)",
+           ylab = "Remission Probability")
+
+```
+
+From the Kaplan-Meier estimate object, we can see that for treatment A, 23 people out of 26 achieved remission and the estimated restricted mean remission time was 69.8 days. For treatment B, 14 people out of 18 achieved remission and the estimated restricted mean survival time was 110.9 days. From the plot, we can see that patients who received treatment A tended to achieve remission earlier than those who received treatment B. We can also see that a patient would be more likely to achieve remission at a later time if they were given treatment B rather than treatment A. 
+
+
+# Question 2
+```{r}
+# load and filter data
+oh22 <- read_csv("/Users/mtjen/Desktop/432/labs/lab01/oh_counties_2022.csv", 
+                 show_col_types = FALSE) |>
+  clean_names() |>
+  mutate(fips = as.character(fips))
+
+# create vector of values for new outcome variable
+newOutcome <- c()
+
+# iterate through rows
+for (x in 1:nrow(oh22)) {
+  count <- 0
+  rowVals <- oh22[x,]
+  srohVal <- rowVals$sroh_fairpoor
+  obeseVal <- rowVals$obese_pct
+  exerciseVal <- rowVals$exer_access
+  waterVal <- rowVals$h2oviol
+  
+  # sroh check
+  if (srohVal < 18.1) {
+    count <- count + 1
+  }
+  
+  # obese check
+  if (obeseVal < 34.6) {
+    count <- count + 1
+  }
+  
+  # exercise check
+  if (exerciseVal > 77.2) {
+    count <- count + 1
+  }
+  
+  # water check
+  if (waterVal == "No") {
+    count <- count + 1
+  }
+  
+  newOutcome <- append(newOutcome, count)
+}
+
+# add new variable
+oh22 <- oh22 |>
+  mutate(counts = newOutcome) |>
+  mutate(counts_factor = as.factor(counts))     # new variable to verify count by group
+
+# separate dataset
+testData <- oh22 |>
+  filter(county == "Cuyahoga" | county == "Monroe")
+
+oh22_new <- oh22 |>
+  filter(county != "Cuyahoga") |>
+  filter(county != "Monroe")
+
+# check summary
+summary(oh22_new$counts_factor)
+```
+
+```{r}
+# build regression models
+bigModel <- pscl::zeroinfl(counts ~ dm_prev + phys_days + 
+                         food_env + inactive_pct, data = oh22_new)
+
+countreg::rootogram(bigModel)
+
+smallModel <- pscl::zeroinfl(counts ~ dm_prev + inactive_pct, data = oh22_new)
+
+countreg::rootogram(smallModel)
+
+# see fits on training data
+mets <- metric_set(rsq, rmse, mae)
+
+bigFit <- oh22_new |>
+    mutate("fitted" = predict(bigModel, type = "response"),
+           "resid" = resid(bigModel, type = "response"))
+
+smallFit <- oh22_new |>
+    mutate("fitted" = predict(smallModel, type = "response"),
+           "resid" = resid(smallModel, type = "response"))
+
+bigSummary <- mets(bigFit, truth = counts, estimate = fitted) |>
+  mutate(model = "big") |> relocate(model)
+
+smallSummary <- mets(smallFit, truth = counts, estimate = fitted) |>
+  mutate(model = "small") |> relocate(model)
+
+bigSummary |> kable(digits = 3)
+smallSummary |> kable(digits = 3)
+```
+
+From the rootograms, the two models predictions performed nearly identically on the training data. Looking at the metric function results, the models also perform the same so because of this, we will select the smaller model because it is a simpler model to run and to interpret. 
+
+```{r}
+# predict
+smallPredict <- predict(smallModel, newdata = testData, type.predict = "response")
+
+results <- bind_cols(testData, 
+                     prediction = smallPredict)
+
+mets(results, truth = counts, estimate = prediction) |> kable()
+```
+
+Using our preferred smaller model, we predicted results for Cuyahoga and Monroe County. We can see that our $R^2$ = 1, RMSE = 0.253, and MAE = 0.237. The $R^2$ = 1 because there are only two observations, so both of them are technicalaly "on" the regression line. The root mean squared error are 0.253 and the mean absolute error is 0.237. Both of these error metrics are quite small, which means that our model's predictions are close to the actual result. This means that for these two counties, the variables that represent the percentage of adults with a diabetes diagnosis (`dm_prev`) and the percentage of adults that report no leisure-time physical activity (`inactive_pct`) are good variables to predict the count outcome. Just for reference, we will show the predicted and actual values to see how close they are.
+
+```{r}
+results |> select(counts, prediction)
+```
+
+
+# Session Information
+
+```{r}
+xfun::session_info()
+```
