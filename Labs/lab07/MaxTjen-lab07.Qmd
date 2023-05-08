@@ -1,0 +1,167 @@
+---
+title: "432: Lab 07"
+author: "Max Tjen"
+date: last-modified
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-overflow: wrap
+    embed-resources: true
+    date-format: iso
+    theme: default
+---
+
+## R Packages and Setup
+
+```{r}
+#| message: false
+#| warning: false
+
+knitr::opts_chunk$set(comment = NA) 
+
+library(janitor) 
+library(rms)
+library(kableExtra)
+library(broom)
+library(tidyverse) 
+
+theme_set(theme_bw())
+```
+
+
+# Question 1
+```{r}
+# load and filter data
+oh22 <- read_csv("/Users/mtjen/Desktop/432/labs/lab01/oh_counties_2022.csv", 
+                 show_col_types = FALSE) |>
+  clean_names() |>
+  mutate(fips = as.character(fips))
+
+# data is normal - split years_lost_rate into categories and relevel
+##### lower 25% - middle 50% - higher 25%
+quantile(oh22$years_lost_rate)
+
+oh22 <- oh22 |> 
+  mutate(median_income = median_income / 1000) |>
+  mutate(years_lost_cat = factor(case_when(years_lost_rate > 0 & 
+                                             years_lost_rate < 7546.50 ~ "Low",
+                                           years_lost_rate >= 7546.50 & 
+                                             years_lost_rate < 9802.25 ~ "Middle",
+                                           years_lost_rate >= 9802.25 ~ "High"))) |>
+  mutate(years_lost_cat = factor(years_lost_cat, 
+                                 levels = c("Low", "Middle", "High"),
+                                 ordered = TRUE))
+
+# separate dataset
+testData <- oh22 |>
+  filter(county == "Cuyahoga" | county == "Monroe")
+
+oh22_new <- oh22 |>
+  filter(county != "Cuyahoga") |>
+  filter(county != "Monroe")
+```
+
+We divided `years_lost_rate` into groups by using quartile values because the distribution appeared to be quite normal. To account for this, we wanted the "Middle" category to contain more counties, so after the division, the "Low" and "High" categories each contained 22 counties while "Middle" had 42.
+
+## Part A
+```{r}
+q1_data <- oh22_new |>
+  select(lbw_pct, pcp_ratio, median_income, sev_housing, years_lost_cat)
+
+# distribution
+dist <- datadist(q1_data)
+options(datadist = "dist")
+
+# create model 
+q1_model <- lrm(years_lost_cat ~ lbw_pct + pcp_ratio + median_income + sev_housing,
+                data = q1_data, x = TRUE, y = TRUE)
+
+# get coefficients
+summary(q1_model)
+
+exp(q1_model$coefficients) |>
+  kable(digits = 3)
+
+# assess model performance
+q1_model
+
+set.seed(12321)
+validate(q1_model)
+```
+
+Here, we build our model to predict `years_lost_cat` using the predictor variables `lbw_pct`, `pcp_ratio`, `median_income`, and `sev_housing`. After fitting the model, we got both it's unvalidated and validated C statistic and $R^2$. The unvalidated C statistic is 0.901, which is very good, and the $R^2$ value is 0.672 which is also decent. Once we validated the model, the C statistic was 0.896, which is still quite good and could be calculated using the Dxy value. The validated $R^2$ is 0.649, which is still decent. 
+
+## Part B
+From these C and $R^2$ statistic values, we can see that our model performs well in predicting our outcome variable `years_lost_cat`. Once we look at the exponentiated coefficients, we can see that `lbw_pct` and `sev_housing` are positive. This means that for each of `lbw_pct` and `sev_housing`, a county with higher values will have higher odds of having higher amounts of years lost if the other three predictor variables are held constant. `median_income` is below 0, which means that a county with higher values will have lower odds of having higher amounts of years lost if the other predictor variables are held constant. Lastly `pcp_ratio` is effectively 1 (raw value = 0.9999230), which means that it's value doesn't have much of an impact on a county's predicted amounts of years lost with all other predictor variables held constant. Looking at the model summary, we can see that 0 is included in the coefficient confidence intervals for `pcp_ratio` and `sev_housing`, meaning that we can't be certain about the effect direction.
+
+## Part C
+```{r}
+# make predictions
+q1_pred <- predict(q1_model, newdata = testData, type = "fitted.ind")
+q1_pred |> kable(digits = 3)
+
+# look at actual categories
+testData <- testData |>
+  mutate(prediction = q1_pred)
+testData |> select(county, years_lost_cat)
+```
+
+For Cuyahoga and Monroe County, our method of `years_lost_cat` division labeled each county as being in the "Middle" category. Our model predicts that Cuyahoga County has a very high likelihood of being in the "High" category, with a small chance of being within "Middle". It also predicts that Monroe County has a high likelihood of being in the "Middle" category, with a decent chance of being in "High". From this, we can conclude that the predictions are alright overall because the Monroe County prediction was accurate but the Cuyahoga County prediction was very off as it predicted a very high likelihood of the county being in the "High" category when it was actually in "Middle".
+
+
+# Question 2
+
+## Part A
+```{r}
+# load data
+lab7q2 <- read_csv("/Users/mtjen/Desktop/432/labs/lab07/lab7q2.csv", 
+                    show_col_types = FALSE) |>
+  clean_names()
+
+# find rows with at least one NA
+na_rows <- lab7q2[rowSums(is.na(lab7q2)) > 0, ]
+nrow(na_rows)
+```
+
+Here, we create a tibble and we can see that there are 97 rows within `lab7q2` that have at least one missing value.
+
+## Part B
+```{r}
+# distribution
+dist <- datadist(lab7q2)
+options(datadist = "dist")
+
+set.seed(4322023)
+
+# multiple imputation object
+imp_fit <- aregImpute(alive ~ age + treated + comor + female,
+                      nk = c(0, 3), tlinear = TRUE, B = 10, pr = FALSE,
+                      data = lab7q2, n.impute = 20)
+
+# logistic regression model
+q2_model <- fit.mult.impute(alive ~ age + treated + comor + female,
+                            fitter = glm, xtrans = imp_fit,
+                            x = TRUE, y = TRUE, pr = FALSE,
+                            data = lab7q2)
+```
+
+Here, we use multiple imputation to impute the missing values in our data. With this, we can fit a logistic regression model to predict vital status.
+
+## Part C
+```{r}
+tidy(q2_model, exponentiate = TRUE, conf.int = TRUE, conf.level = 0.95) |> 
+  select(term, estimate, conf.low, conf.high, p.value) |> 
+  kable(dig = 2)
+```
+
+The effect of receiving a treatment in this model is 1.20 (1.15, 1.26). This means that a patient receiving a treatment is 1.20 times more likely than a patient not receiving a treatment (control group) to be alive at the end of the study if all of their other predictor variables values are the same. Because the entire 95% confidence interval is above 1, we can be confident that about the direction of effects and that having a treatment increases one's odds of surviving with all other variables held constant.
+
+
+# Session Information
+
+```{r}
+xfun::session_info()
+```
