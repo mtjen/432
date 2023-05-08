@@ -1,0 +1,830 @@
+---
+title: "Estimating Cars' Yearly Fuel Costs and Transmission Type Using EPA Data"
+author: "Max Tjen"
+date: last-modified
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-overflow: wrap
+    embed-resources: true
+    date-format: iso
+    theme: default
+---
+
+## R Packages and Setup {.unnumbered}
+
+```{r}
+#| message: false
+#| warning: false
+
+knitr::opts_chunk$set(comment = NA)
+
+library(janitor)
+library(stringr)
+library(naniar)
+library(broom)
+library(rms)
+library(GGally)
+library(kableExtra)
+library(caret)
+library(pROC)
+library(tidyverse)
+
+theme_set(theme_bw())
+```
+
+# Data Source
+
+This data is from the "Tidy Tuesday archive" datasets on Github, which can be found [here](https://github.com/rfordatascience/tidytuesday/tree/master/data/2019/2019-10-15). The data dictionary can also be found [here](https://www.fueleconomy.gov/feg/ws/index.shtml#fuelType1). The data was gathered by the United States Environmental Protection Agency (EPA) via the "EPA's National Vehicle and Fuel Emissions Laboratory in Ann Arbor, Michigan, and by vehicle manufacturers who submit their own test data to EPA". With this, there was no sampling strategy and the data was collected to have more information about cars' fuel economy estimates.
+
+
+# The Subjects
+
+The subjects of our data describe various car models from various manufacturers and they were sampled based on when the cars were tested for EPA compliance.
+
+
+# Loading and Tidying the Data
+
+## Loading the Raw Data
+
+```{r}
+# load data
+data <- read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2019/2019-10-15/big_epa_cars.csv", show_col_types = FALSE)
+```
+
+Here, we ingest our data from the URL where the dateset is.
+
+## Cleaning the Data
+
+### Selecting Variables We'll Use
+
+There are a number of steps that we have to take to get our dataset prepared, beginning with getting a subset of variables from the original dataset. These variables represent our predictor, outcome, and identifying variables. We also want to create a new variable, `decade`, which will represent the decade when the vehicle was recorded.
+
+```{r}
+# subset variables
+data <- data |>
+  select(id, make, model, year, comb08, cylinders, displ,
+         drive, fuelCost08,fuelType1, trany, tCharger) |>
+  clean_names()
+
+# create decade variable
+data <- data |>
+    mutate(decade = case_when(year < 1990 ~ "1980s",
+                              1990 <= year & year < 2000 ~ "1990s",
+                              2000 <= year & year < 2010 ~ "2000s",
+                              2010 <= year & year < 2020 ~ "2010s",
+                              TRUE ~ "2020s"))
+```
+
+### Changing Variable Names
+
+We also want to change the names of some of our variables to be more concise and descriptive.
+
+```{r}
+# change variable names and drop original category variables
+data <- data |>
+  mutate(mpg = comb08) |>
+  mutate(displacement = displ) |> 
+  mutate(yearly_fuel_cost = fuel_cost08) |> 
+  mutate(fuel_type = fuel_type1) |> 
+  mutate(transmission = trany) |> 
+  mutate(is_turbo = t_charger) |> 
+  select(id, make, model, year, decade, mpg, 
+         cylinders, displacement, drive, 
+         yearly_fuel_cost, fuel_type, 
+         transmission, is_turbo)
+```
+
+### Converting Variable Types
+
+Some of the variables' data type also have to be appropriately adjusted, so we will do so accordingly.
+
+```{r}
+data <- data |>
+  mutate(id = as.character(id)) |>
+  mutate(year = as.character(year)) |>
+  mutate(cylinders = as.factor(cylinders)) |>
+  mutate(drive = as.factor(drive)) |>
+  mutate(fuel_type = as.factor(fuel_type)) |>
+  mutate(transmission = as.factor(transmission)) |> 
+  mutate(is_turbo = as.factor(is_turbo)) |>
+  mutate(decade = as.factor(decade))
+```
+
+### Changing Values
+
+Another thing that we have to do is make some variable values more descriptive and usable by the models. 
+
+```{r}
+# change value options to only Manual or Automatic
+data$transmission <- word(data$transmission, 1)
+
+data <- data |>
+  mutate(transmission = as.factor(transmission))
+
+# turn NA values into 0
+data <- data |>
+  mutate(is_turbo = case_when(is.na(is_turbo) ~ 0, TRUE ~ 1)) |> 
+  mutate(is_turbo = as.factor(is_turbo))
+```
+
+### Sampling the Data
+
+We also want to filter out some data from the original dataset so we have a more precise pool of car models. Lastly, we will set a seed and then use slice_sample() to subset our data because the full dataset is too large.
+
+```{r}
+# keep most common number of cylinders
+data <- data |>
+  filter(cylinders == 4 |
+           cylinders == 6 | 
+           cylinders == 8 | 
+           is.na(cylinders))
+
+# remove two wheel drive as not very descriptive -> can be front or rear
+data <- data |>
+  filter(drive != "2-Wheel Drive")
+
+# only keep models that run on Regular/Premium Gasoline
+data <- data |>
+  filter(fuel_type == "Regular Gasoline" | 
+           fuel_type == "Premium Gasoline")
+
+# set seed for sampling
+set.seed(432)
+
+# get subset of data
+epa_data <- data |>
+  slice_sample(n = 1200)
+
+# check dimensions of data
+dim(epa_data)
+```
+
+### Working with Categorical Predictors
+
+Here, we will ensure that each of our categorical predictor variables meet specifications.
+
+```{r}
+summary(epa_data$cylinders)
+summary(epa_data$drive)
+summary(epa_data$fuel_type)
+summary(epa_data$transmission)
+summary(epa_data$is_turbo)
+summary(epa_data$decade)
+```
+
+We can see that for `drive`, there are only 9 models that are "Part-time 4-Wheel Drive" in, so we will just drop these models because they aren't very common nowadays and they also don't represent much of the data.
+
+```{r}
+epa_data <- epa_data |>
+  filter(drive != "Part-time 4-Wheel Drive")
+```
+
+We can also see that we have 24 vehicles that were made in the 2020s, so we will collapse this group with vehicles made in the 2010s.
+
+```{r}
+epa_data <- epa_data |>
+    mutate(decade = case_when(year < 1990 ~ "1980s",
+                              1990 <= year & year < 2000 ~ "1990s",
+                              2000 <= year & year < 2010 ~ "2000s",
+                              TRUE ~ "2010+"))
+
+epa_data <- epa_data |>
+  mutate(decade = as.factor(decade))
+```
+
+Because we removed observations of certain categories, we want to drop these unused ones. To do so, we will utilize droplevels().
+
+```{r}
+epa_data <- epa_data |>
+  mutate(cylinders = droplevels(epa_data$cylinders)) |>
+  mutate(drive = droplevels(epa_data$drive)) |>
+  mutate(fuel_type = droplevels(epa_data$fuel_type)) 
+```   
+
+### Arranging the Tibble
+
+We already have our `id` variable on the far left, but we want to move our outcome variables to the far right for readability.
+
+```{r}
+epa_data <- epa_data |>
+  select(id, make, model, year, decade, mpg, 
+         cylinders, displacement, drive, 
+         fuel_type, is_turbo,
+         transmission, yearly_fuel_cost)
+```
+
+
+# The Tidy Tibble
+
+## Listing the Tibble
+
+Here, we will list our final tidy dataset, which has 1,191 rows and 13 columns.
+
+```{r}
+epa_data
+```
+
+## Size and Identifiers
+
+```{r}
+# get number of unique id values
+length(unique(epa_data$id))
+
+# get number of rows in data
+dim(epa_data)
+
+# get type of id variable
+class(epa_data$id)
+```
+
+We will now check to see if there are the correct number of unique identifiers in `id` by comparing its value to the number of rows. We can also see that `id` is of the character type and that there are 1,191 rows and 13 variables. Since there are also 1,191 unique `id` values, we know that each row has a unique identifier.
+
+## Save The Tibble
+
+```{r}
+saveRDS(epa_data, "/Users/mtjen/desktop/432/projectA/epa_data.Rds")
+```
+
+Here, we will save our tidied tibble as an R dataset.
+
+
+# The Code Book
+
+## Defining the Variables
+
+The following is our code book to help define variables in our data.
+
+ Variable | Role | Type | Description
+--------- | ---- | ---- | ------------
+ `id` | identifier | character | vehicle identifier
+ `make` | identifier | character | vehicle company/manufacturer
+ `model` | identifier | character | vehicle model
+ `year` | identifier | character | vehicle year
+ `decade` | input | categorical (4) | vehicle decade ["1980s", "1990s", "2000s", "2010+"]
+ `mpg` | input | quantitative | combined miles per gallon
+ `cylinders` | input | categorical (3) | number of engine cylinders [4, 6, 8]
+ `displacement` | input | quantitative | engine displacement (liters)
+ `drive` | input | categorical (5) | type of drive axle ["4-Wheel Drive", "4-Wheel or All-Wheel Drive", "All-Wheel Drive", "Front-Wheel Drive", "Rear-Wheel Drive"]
+ `fuel_type` | input | categorical (2) | type of fuel ["Premium Gasoline", "Regular Gasoline"]
+ `is_turbo` | input | categorical (2) | whether or not the vehicle is turbocharged [0, 1]
+ `transmission` | input, outcome | categorical (2) | type of transmission ["Automatic", "Manual"]
+ `yearly_fuel_cost` | outcome | quantitative | yearly cost of fuel
+
+## Numerical Description
+
+Next, we will look at quick numerical summaries/descriptions of our variables.
+
+```{r}
+Hmisc::describe(epa_data)
+```
+
+
+# Linear Regression Plans
+
+## My First Research Question
+
+Given vehicle time frame, engine properties, and transmission information, can we predict the yearly fuel cost of the vehicle?
+
+## My Quantitative Outcome
+
+The outcome variable that we will be using is `yearly_fuel_cost` and I am interested in this because of how in general, companies are trying to make cars as fuel efficient as possible nowadays. With that, the fuel cost should in theory be decreasing over time. In particular, I would like to see if various vehicle properties excluding miles per gallon will help to accurately predict what the cost will be. 
+
+```{r}
+nrow(epa_data |>
+       filter(complete.cases(yearly_fuel_cost)))
+```
+
+As we can see, there are 1,191 rows with complete information in `yearly_fuel_cost`, which means we don't have any rows with a missing outcome observation.
+
+```{r}
+ggplot(epa_data, aes(x = yearly_fuel_cost)) +
+  geom_histogram(bins = 20, fill = "lightgreen", col = "white") + 
+  labs(title = "Distribution of Yearly Fuel Cost",
+       x = "Yearly Fuel Cost",
+       y = "Number of Vehicles")
+```
+
+Based on this histogram, we can see that the distribution of `yearly_fuel_cost` is pretty symmetric and normal, with a slight right skew. The values are fairly continuous and there doesn't appear to be an obvious natural transformation to consider right now
+
+```{r}
+length(unique(epa_data$yearly_fuel_cost))
+```
+
+As we can see, we have 44 distinct `yearly_fuel_cost` values, which clears the definition of a quantitative variable.
+
+## My Planned Predictors (Linear Model)
+
+The predictor variables we intend to use for the linear regression model are `decade`, `cylinders`, `displacement`, `drive`, `fuel_type`, `is_turbo`, and `transmission`. 
+
+```{r}
+length(unique(epa_data$displacement))
+```
+
+As we can see, we have 53 distinct `displacement` values, which clears the definition of a quantitative variable.
+
+```{r}
+summary(epa_data$cylinders) 
+```
+
+As we can see, `cylinders` is a multi-categorical variable, as there are three levels, each with at least 30 observations.
+
+```{r}
+complete_outcome_rows <- 1191
+7 < 4 + (complete_outcome_rows - 100) / 100
+```
+
+Here, we can see that the total number of predictor variables (7) is appropriate relative to the amount of rows we are going to use.
+
+For our predictors, there are some intuitive predictions we can make regarding the expected direction of relationships with the `yearly_fuel_cost`. Off the bat, less `cylinders` and lower `displacement` will likely lead to less fuel usage, so a lower cost. `fuel_type` can also be logically guessed, as premium gas is more expensive than regular. Regarding `decades`, I would guess that newer cars will have lower costs as cars have become more fuel efficient over time. I have no idea which way `drive` will go, and similarly for `is_turbo`, I'm not really sure but I think that the cost will be less if the car has a turbo. Lastly, I would guess that automatic cars are more fuel efficient than manual cars as the shift points are optimized in theory. 
+
+
+# Logistic Regression Plans
+
+## My Second Research Question
+Given vehicle time frame, fuel consumption information, engine properties, and transmission information, can we predict if the vehicle has an automatic or manual transmission?
+
+## My Binary Outcome
+The outcome variable for our logistic regression model is `transmission`, which specifies if a car is an automatic or manual. I'm interested in this because it's generally believed that automatics are more fuel efficient than manuals and I'd like to investigate if this is a more general fact or more model specific. 
+
+```{r}
+summary(epa_data$transmission)
+```
+
+Here, we can see that in our data we have 846 cars that are automatic and 345 that are manual.
+
+## My Planned Predictors (Logistic Model)
+
+The predictor variables we intend to use for the model are `decade`, `mpg`, `cylinders`, `displacement`, `drive`, and `is_turbo`. Most of these are the same our linear regression model, with the addition of `mpg`, which specifies the vehicle's combined miles per gallon.
+
+```{r}
+length(unique(epa_data$mpg))
+```
+
+As we can see, we have 36 distinct `mpg` values, which clears the definition of a quantitative variable.
+
+```{r}
+smaller_group_rows <- 345
+6 < 4 + (smaller_group_rows - 100) / 100
+```
+
+As we can see, the number of predictor variables for our model is ok.
+
+I'm not sure how `cylinders`, `displacement`, `drive`, and `is_turbo` are going to relate to `transmission`, but I think there's a logical idea for `decade` and `mpg`. For decade, I would expect the number of automatics to increase as more time passes as the number of manual cars have been decreasing. For `mpg`, I think that manual cars will generally have lower values than if it were an automatic, as the shift points aren't as optimized for fuel efficiency.
+
+
+# Linear Regression Analyses
+
+## Missingness
+```{r}
+miss_var_summary(epa_data)
+```
+
+From this table, we can see that our data has no missing values.
+
+## Outcome Transformation
+
+```{r}
+# run box cox model
+box_model <- lm(yearly_fuel_cost ~ 1, data = epa_data)
+car::boxCox(box_model)
+```
+
+The Box-Cox model suggests that lambda is 0, which indicates that we should go with a logarithmic transformation. We will now create a log(yearly_fuel_cost) variable to use as our new outcome variable.
+
+```{r}
+# create log outcome variable
+epa_data <- epa_data |>
+  mutate(log_yearly_fuel_cost = log(yearly_fuel_cost))
+```
+
+## Scatterplot Matrix and Collinearity
+
+```{r}
+# dataset we will use for linear regression model
+linear_data <- epa_data |> 
+  select(decade, cylinders, displacement, drive, fuel_type, 
+         is_turbo, transmission, log_yearly_fuel_cost)
+
+ggpairs(linear_data, title = "Scatterplot Matrix of Variables")
+```
+
+From this scatterplot, we can't really tell if there's any collinearity between our predictors, so we will use look at variance inflation factors to see if there is. 
+
+```{r}
+# create model
+modelA <- lm(log_yearly_fuel_cost ~ decade + cylinders + 
+               displacement + drive + fuel_type + is_turbo + 
+               transmission, 
+             data = linear_data)
+
+# check variance inflation factor
+car::vif(modelA)
+```
+
+Based on vif(), we have an issue with collinearity with `cylinders` and `displacement` as each of the values are above 5. We will drop `cylinders` from our model as `displacement` is our quantitative variable.
+
+```{r}
+# create model
+modelA <- lm(log_yearly_fuel_cost ~ decade + 
+               displacement + drive + fuel_type + is_turbo + 
+               transmission, 
+             data = linear_data)
+
+# check variance inflation factor
+car::vif(modelA)
+```
+
+As we can see, we now have no issues with collinearity.
+
+## Model A
+
+```{r, fig.width = 10, fig.height = 10}
+# fit model
+dist <- datadist(linear_data)
+options(datadist = "dist")
+
+modelA_o <- ols(log_yearly_fuel_cost ~ decade + 
+                  displacement + drive + fuel_type + is_turbo + 
+                  transmission, 
+                data = linear_data, x = TRUE, y = TRUE)
+
+# get coefficient values
+tidy(modelA, conf.int = TRUE, conf.level = 0.90) |> 
+  select(term, estimate, conf.low, conf.high, p.value) |> 
+  kable(dig = 4)
+
+# get key fit summary statistics
+glance(modelA) |>
+  select(r.squared, AIC, BIC) |>
+  kable(digits = 4)
+
+# get residual plots
+par(mfrow = c(2,2)); plot(modelA); par(mfrow = c(1,1))
+```
+
+Here, we fit our main model and we can see that it predicts `log_yearly_fuel_cost` pretty well, with $R^2$ being 0.803. From the residual plots, we can see that there are no issues with linearity, homoscedasticity, normality, and leverage. This is because for the top left, top right, and bottom left graphs, there are no problematic trends and for the bottom left, none of the points are within the contours of Cook's distance.
+
+## Non-Linearity
+
+```{r}
+# build spearman object
+modA_spear <- spearman2(log_yearly_fuel_cost ~ decade + 
+                          displacement + drive + fuel_type + is_turbo + 
+                          transmission, 
+                          data = linear_data)
+
+plot(modA_spear)
+```
+By looking at our Spearman $\rho^2$ plot, we can see that there are two variables that are clearly the most likely to make an impact, which are `displacement` and `drive`. Because we are aiming to add around six degrees of freedom, we are going to add a restricted cubic spline of 4 knots to `displacement`, which will add two additional degrees. We will also add an interaction term between `displacement` and `drive`, which will add four degrees of freedom for a total of six additional degrees.
+
+## Model B
+
+```{r, fig.width = 10, fig.height = 10}
+# fit model
+modelB <- lm(log_yearly_fuel_cost ~ rcs(displacement, 4) + decade +
+               drive + fuel_type + is_turbo + transmission +
+               displacement %ia% drive, 
+             data = linear_data)
+
+dist <- datadist(linear_data)
+options(datadist = "dist")
+
+modelB_o <- ols(log_yearly_fuel_cost ~ rcs(displacement, 4) + decade +
+                  drive + fuel_type + is_turbo + transmission +
+                  displacement %ia% drive,
+                data = linear_data, x = TRUE, y = TRUE)
+
+# get coefficient values
+tidy(modelB, conf.int = TRUE, conf.level = 0.90) |> 
+  select(term, estimate, conf.low, conf.high, p.value) |> 
+  kable(dig = 4)
+
+# plot of effects
+plot(summary(modelB_o))
+
+# get residual plots
+par(mfrow = c(2,2)); plot(modelB); par(mfrow = c(1,1))
+```
+
+Here, we fit our augmented model using both `ols` and `lm` so that we are able to get both the effects plot and the residual plots. From the residual plots, we can see that there are again no issues with linearity, homoscedasticity, normality, and leverage. This is because for the top left, top right, and bottom left graphs, there are no problematic trends and for the bottom left, none of the points are within the contours of Cook's distance.
+
+## Model Validation
+
+```{r}
+# validate model A
+set.seed(123454321)
+validate(modelA_o)
+
+# validate model B
+set.seed(123454321)
+validate(modelB_o)
+```
+
+After validating the main effects and augmented models, we can see the validated $R^2$ and mean squared error values. In terms of both metrics, it appears that the augmented model performs slightly better.
+
+## Final Model
+
+After everything, I would choose the main effects model over the augmented model even though the augmented model performed better. As seen before, the residual plots for both models were nearly the same and the augmented model's validated $R^2$ was only 0.0161 better than the main effect's validated $R^2$. Similarly, the validated MSE of the augmented model is 0.0011 better than the validated MSE of  the main effect model. In my opinion, these small increase aren't worth adding an extra six degrees of freedom to our main effects model. 
+
+```{r}
+# get coefficient values
+tidy(modelA, conf.int = TRUE, conf.level = 0.90) |> 
+  select(term, estimate, conf.low, conf.high, p.value) |> 
+  kable(dig = 4)
+```
+
+These are the coefficients of our final model with a 90% confidence interval.
+
+```{r}
+# get numeric effect sizes
+summary(modelA_o) |> kable(digits = 3)
+
+# plot effect sizes
+plot(summary(modelA_o))
+```
+
+`displacement`: If we have two subjects from the same decade, cylinders, drive, fuel type, is_turbo, and transmission, then if subject 1 has a displacement of 2.2 liters and subject 2 has a displacement of 4 liters, then the model estimates that subject 2 will have a `log_yearly_fuel_cost` that is 0.235 higher than subject 1. The 95% confidence interval around that estimated effect on `log_yearly_fuel_cost` ranges from (0.222, 0.247). The increase in yearly fuel cost makes sense with higher displacement engines because displacement measures the volume of air that is moved by pistons inside the cylinders of an engine. Because of the combustion processes occurring within cylinders, the engine's air/fuel ratio has to stay relatively constant to maintain a healthy engine. As such, more displacement means that more air is being taken in by the engine, in turn leading to more fuel consumption. With all of this, more fuel is used which means that more money has to be spent on fuel.
+
+```{r}
+# validate model A
+set.seed(123454321)
+validate(modelA_o)
+```
+
+Again, the validated $R^2$ value for Model A is 0.7975, which is pretty good.
+
+```{r, fig.width = 10, fig.height = 10}
+# nomogram
+plot(nomogram(modelA_o, fun = exp, abbrev = TRUE), 
+     cex.axis = 0.4)                                  # font size
+```
+
+Here is the model A nomogram, where we can make a prediction as to a vehicle's yearly fuel cost using set input parameters. As examples, we will select some vehicles that are in the original dataset but were excluded from the final dataset due to size.
+
+```{r}
+# make original dataset look same as final dataset
+data <- data |>
+  mutate(log_yearly_fuel_cost = log(yearly_fuel_cost)) |>
+  mutate(decade = case_when(year < 1990 ~ "1980s",
+                              1990 <= year & year < 2000 ~ "1990s",
+                              2000 <= year & year < 2010 ~ "2000s",
+                              TRUE ~ "2010+"))
+
+# get unmatched rows
+notInc <- anti_join(data, epa_data)
+
+# find cars
+bmw <- notInc |> 
+  filter(make == "BMW") |> 
+  filter(model == "M3") |>
+  filter(year == 1996) |>
+  filter(transmission == "Manual")
+
+mini <- notInc |> 
+  filter(make == "MINI") |> 
+  filter(model == "Clubman") |>
+  filter(year == 2011) |>
+  filter(transmission == "Manual")
+
+# get predicted values
+bmw_pred <- exp(predict.lm(modelA, newdata = bmw, 
+                           interval = "prediction", level = 0.90))
+
+mini_pred <- exp(predict.lm(modelA, newdata = mini, 
+                            interval = "prediction", level = 0.90))
+
+bmw_pred
+bmw |> select(yearly_fuel_cost)
+
+mini_pred
+mini |> select(yearly_fuel_cost)
+```
+
+Here, we will get predictions of yearly fuel cost for two cars that my parents had. For the BMW, it was predicted that the yearly fuel cost would be 2,652.335 with a 90% confidence interval of (2,188.382, 3,214.648). The actual yearly fuel cost was 2,350, so it wasn't that close to the prediction but it did fall within the confidence interval. For the Mini, it was predicted that the yearly fuel cost would be 1,610.039 with a 90% confidence interval of (1,328.101, 1,951.827). The actual yearly fuel cost was 1,650, which is quite close to the predicted value.
+
+
+# Logistic Regression Analyses
+
+## Missingness
+```{r}
+miss_var_summary(epa_data)
+```
+
+From this table, we can see that our data has no missing values.
+
+## Model Y
+```{r}
+# data for logistic regression
+logistic_data <- epa_data |> 
+  select(decade, mpg, cylinders, displacement, 
+         drive, is_turbo, transmission) |>
+  mutate(is_auto = case_when(transmission == "Automatic" ~ 1,
+                             TRUE ~ 0))
+
+# fit glm model
+modelY_glm <- glm(is_auto ~ decade + mpg + cylinders + 
+                    displacement + drive + is_turbo, 
+              data = logistic_data, family = binomial(link = "logit"))
+
+# data distribution
+dist <- datadist(logistic_data)
+options(datadist = "dist")
+
+# fit lrm model
+modelY_lrm <- lrm(is_auto ~ decade + mpg + cylinders + 
+                    displacement + drive + is_turbo, 
+              data = logistic_data, x = TRUE, y = TRUE)
+
+# get coefficient values
+tidy(modelY_glm, exponentiate = TRUE, conf.int = TRUE, conf.level = 0.90) |> 
+  select(term, estimate, conf.low, conf.high, p.value) |> 
+  kable(dig = 4)
+
+# effects sizes
+summary(modelY_lrm)
+plot(summary(modelY_lrm))    
+
+# summary statistics
+modelY_lrm$stats["C"]
+modelY_lrm$stats["R2"]
+
+# confusion matrix
+confusion_data <- augment(modelY_glm, type.predict = "response")
+
+confMatrix <- confusionMatrix(data = factor(confusion_data$.fitted >= 0.5),
+                              reference = factor(confusion_data$is_auto == 1),
+                              positive = "TRUE")
+
+confMatrix
+```
+
+Here, we create both glm() and lrm() models for our model Y where we can see numerous things about the main effect. The coefficients are already exponentiated and represent the odds ratio of a vehicle's transmission being automatic, so for example the coefficient for `is_turbo1` is 0.9604. This means that with all other variables constant, a car with a turbo is 0.9604 times as likely to have an automatic transmission as one without a turbo. We can then see the numeric effect size values along with a plot of the effects. These effect values represent how the odds ratio changes for the specified change. With `cylinders - 8:4` for instance, the effect size is 0.846820. This means that with all other variables held constant, a car with an engine with 8 cylinders will be 0.846820 times as likely to be an automatic as a car with a 4 cylinder engine. The Nagelkerke $R^2$ value is 0.232 and the C statistic, or area under the ROC curve, is 0.753, which is pretty decent. For the confusion matrix, we used a prediction rule of if a fitted value is greater than 0.5, the observation will be classified as having an automatic transmission. The specificity is 0.3478, the sensitivity is 0.9007, and the positive predictive value is 0.7720.
+
+## Non-Linearity
+
+```{r}
+# build spearman object
+modY_spear <- spearman2(transmission ~ decade + mpg + cylinders + 
+                          displacement + drive + is_turbo, 
+                          data = logistic_data)
+
+plot(modY_spear)
+```
+
+By looking at our Spearman $\rho^2$ plot, we can see that `cylinders`, `displacement`, and `decade` are the variables most likely to make a difference. Because we are aiming to add between three and six degrees of freedom, we are going to add an interaction term between `cylinders` and `displacement`, which will add two degrees. We are also going to add an interaction term between `displacement` and `decade`, which will add another three degrees for a total of five.
+
+## Model Z
+
+```{r}
+# fit glm model
+modelZ_glm <- glm(is_auto ~ decade + mpg + cylinders + 
+                    displacement + drive + is_turbo +
+                    displacement * cylinders + displacement * decade, 
+              data = logistic_data, family = binomial(link = "logit"))
+
+# data distribution
+dist <- datadist(logistic_data)
+options(datadist = "dist")
+
+# fit lrm model
+modelZ_lrm <- lrm(is_auto ~ decade + mpg + cylinders + 
+                    displacement + drive + is_turbo + 
+                    displacement * cylinders + displacement * decade, 
+              data = logistic_data, x = TRUE, y = TRUE)
+
+# get coefficient values
+tidy(modelZ_glm, exponentiate = TRUE, conf.int = TRUE, conf.level = 0.90) |> 
+  select(term, estimate, conf.low, conf.high, p.value) |> 
+  kable(dig = 4)
+
+# effects sizes
+summary(modelZ_lrm)
+plot(summary(modelZ_lrm))    
+
+# summary statistics
+modelZ_lrm$stats["C"]
+modelZ_lrm$stats["R2"]
+
+# confusion matrix
+confusion_data <- augment(modelZ_glm, type.predict = "response")
+
+confMatrix <- confusionMatrix(data = factor(confusion_data$.fitted >= 0.5),
+                              reference = factor(confusion_data$is_auto == 1),
+                              positive = "TRUE")
+
+confMatrix
+```
+
+Here, we create both glm() and lrm() models for our model Z. As before, the coefficients are already exponentiated and represent the odds ratio of a vehicle’s transmission being automatic. For example the coefficient for is_turbo1 is 1.0853, which means that with all other variables constant, a car with a turbo is 1.0853 times as likely to have an automatic transmission as one without a turbo. The effect size values represent how the odds ratio changes for the specified change. With cylinders - 8:4 for instance, the effect size is 0.067039. This means that with all other variables held constant, a car with an engine with 8 cylinders will be 0.067039 times as likely to be an automatic as a car with a 4 cylinder engine. The Nagelkerke $R^2$ value is 0.238 and the C statistic, or area under the ROC curve, is 0.756. For the confusion matrix, we used a prediction rule of if a fitted value is greater than 0.5, the observation will be classified as having an automatic transmission. The specificity is 0.3159, the sensitivity is 0.9066, and the positive predictive value is 0.7647.
+
+## Model Validation
+
+```{r}
+# validate model Y
+set.seed(123454321)
+validate(modelY_lrm)
+
+# validate model Z
+set.seed(123454321)
+validate(modelZ_lrm)
+```
+
+By validating each of these models, we can see that for model Y, the validated $R^2$ is 0.210 and the validated C statistic is 0.741. For model Z, the validated $R^2$ is 0.208 and the validated C statistic is 0.740.
+
+## Final Model
+
+Model Y is better in terms of specificity, positive predictive value, validated $R^2$, and validated C while model Z is better in only sensitivity. Because of this as well is the simplified nature of the model, we will select model Y as our final model.
+
+```{r}
+# get parameters
+tidy(modelY_glm, exponentiate = TRUE, conf.int = TRUE, conf.level = 0.90) |> 
+  select(term, estimate, conf.low, conf.high, p.value) |> 
+  kable(dig = 4)
+
+# effect sizes
+summary(modelY_lrm) |> kable(digits = 3)
+plot(summary(modelY_lrm)) 
+```
+
+`decade`: If we have two subjects from the same displacement, cylinders, drive, fuel type, is_turbo, and transmission, then if subject 1 was from the 1980's and subject 2 was from the 2010+, then the model predicts subject 1 is 0.298 times as likely as subject 2 to have an automatic transmission. This makes sense as automatic cars have been becoming much more prominent, particularly in the United States. As such, it is much more likely for a more recent car to have an automatic transmission than an older car.
+
+```{r}
+# plot ROC curve
+predictions <- predict(modelY_glm, type = "response")
+rocCurve <- roc(modelY_glm$data$is_auto, predictions)
+plot(rocCurve, col = "blue")
+legend("topleft", legend = paste("AUC: ", round_half_up(auc(rocCurve), 3)))
+```
+
+Here is our ROC curve for model Y with our entire dataset.
+
+```{r}
+# statistics
+set.seed(123454321)
+validate(modelY_lrm)
+
+0.5 + (0.4818 / 2)
+```
+
+Here, we can see our validated $R^2$ is 0.210 and our validated C statistic is 0.7409.
+
+```{r, fig.width = 10, fig.height = 10}
+# nomogram
+plot(nomogram(modelY_lrm))
+```
+
+Here is the nomogram for model Y.
+
+```{r}
+# find cars for example
+oldAccord <- epa_data |> 
+  filter(make == "Honda") |> 
+  filter(model == "Accord") |>
+  filter(year == 1989) |>
+  filter(transmission == "Manual")
+
+newAccord <- epa_data |> 
+  filter(make == "Honda") |> 
+  filter(model == "Accord") |>
+  filter(year == 2012) |>
+  filter(transmission == "Manual")
+
+
+# see each of their values
+oldAccord
+newAccord
+
+# get predicted values
+predict(modelY_glm, newdata = oldAccord, type = "response")
+predict(modelY_glm, newdata = newAccord, type = "response")
+```
+
+For our predicted probability example between two subjects of interest, we are using two manual Honda Accords, with one being from 1989 and the 2012. The parameter values are very similar, with the different ones being `decade`, `mpg`, and `displacement`. The `mpg` and `displacement` values are still similar between the two models, so the big contrasting parameter is `decade`. As we can see, the probability of the 1989 model having an automatic transmission is 0.476 and the probability of the 2012 model having an automatic transmission is 0.775.
+
+
+# Discussion
+
+Something that was substantially harder than I expected was getting my nomogram to present decently well for my final linear model. For the `decade` and `drive` variables, a couple of the levels' labels would clash with each other because their point values are very close together. As such, I had to play around with the nomogram function's parameters for awhile to make it so that all of the labels would be visible and obvious. While this isn't a particularly hard issue to fix, it was tedious in having to look up the function documentation and then playing with various parameters to get an acceptable result. 
+
+The most useful thing that I learned was with interpreting the Spearman plots and creating interaction terms for our models. While I already knew how to independently read Spearman plots and create interaction terms, I didn't have practical experience with determining what interaction terms to create based on additional degrees of freedom. This is useful because we want to be careful in how many degrees of freedom to add to the model in practical applications, so it was good to have to take this into account.
+
+
+# Affirmation
+
+I am certain that it is completely appropriate for these EPA data to be shared with anyone, without any conditions. There are no concerns about privacy or security.
+
+
+# References
+
+The data that we are using is located on Github ([ https://github.com/rfordatascience/tidytuesday/tree/master/data/2019/2019-10-15](https://github.com/rfordatascience/tidytuesday/tree/master/data/2019/2019-10-15)) and is originally from the Environmental Protection Agency (EPA). The dataset is similar to the mtcars dataset that is already built into R, except that it includes many more vehicles and variables. The full data dictionary for the dataset can also be found on fueleconomy.gov ([https://www.fueleconomy.gov/feg/ws/index.shtml#fuelType1](https://www.fueleconomy.gov/feg/ws/index.shtml#fuelType1)).
+
+
+# Session Information
+
+```{r}
+xfun::session_info()
+```
