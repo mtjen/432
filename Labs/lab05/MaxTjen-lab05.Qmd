@@ -1,0 +1,133 @@
+---
+title: "432: Lab 05"
+author: "Max Tjen"
+date: last-modified
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-overflow: wrap
+    embed-resources: true
+    date-format: iso
+    theme: default
+---
+
+## R Packages and Setup
+
+```{r}
+#| message: false
+#| warning: false
+
+knitr::opts_chunk$set(comment = NA) 
+
+library(janitor) 
+library(knitr)
+library(patchwork)
+library(naniar)
+library(forcats)
+library(tableone)
+library(tidyverse) 
+
+theme_set(theme_bw())
+```
+
+
+# Question 1
+
+```{r}
+# load and filter data
+hbp <- read_csv("/Users/mtjen/Desktop/432/labs/lab02/hbp3456.csv", 
+                show_col_types = FALSE) |>
+  mutate(bmi = weight / (height^2)) |>
+  mutate(bmi_cat = factor(case_when(bmi > 0 & bmi < 18.5 ~ "Underweight",
+                                    bmi >= 18.5 & bmi < 25 ~ "Healthy Weight",
+                                    bmi >= 25 & bmi < 30 ~ "Overweight",
+                                    bmi >= 30 ~ "Obesity"))) |>
+  select(record, practice, age, race, eth_hisp, 
+         sex, insurance, bmi, bmi_cat, sbp, dbp) |>
+  filter(practice == "Highland" | practice == "Sycamore") |>
+  mutate(practice = as.factor(practice), 
+         race = as.factor(race),
+         eth_hisp = as.factor(eth_hisp),
+         sex = as.factor(sex),
+         insurance = as.factor(insurance), 
+         race = fct_relevel(race, "AA_Black", "Asian", "White", "Other"), 
+         insurance = fct_relevel(insurance, "Uninsured", "Medicaid", 
+                                 "Medicare", "Commercial"), 
+         bmi_cat = fct_relevel(bmi_cat, "Underweight", "Healthy Weight", 
+                               "Overweight", "Obesity"))
+
+# create QQ plots for quantitative variables to check normality
+p1 <- ggplot(hbp, aes(sample = age)) +
+  geom_qq() + 
+  geom_qq_line() +
+  labs(title = "Distribution of Age",
+       x = "Age",
+       y = "Number of Patients")
+
+p2 <- ggplot(hbp, aes(sample = bmi)) +
+  geom_qq() + 
+  geom_qq_line() +
+  labs(title = "Distribution of BMI",
+       x = "BMI",
+       y = "Number of Patients")
+
+p3 <- ggplot(hbp, aes(sample = sbp)) +
+  geom_qq() + 
+  geom_qq_line() +
+  labs(title = "Distribution of SBP",
+       x = "SBP",
+       y = "Number of Patients")
+
+p4 <- ggplot(hbp, aes(sample = dbp)) +
+  geom_qq() + 
+  geom_qq_line() +
+  labs(title = "Distribution of DBP",
+       x = "DBP",
+       y = "Number of Patients")
+
+# display plots
+(p1 + p2) / (p3 + p4) +
+  plot_annotation(title = "Value Distributions for Quantitative Variables")
+
+# check NA values
+miss_var_summary(hbp)
+
+# create table
+vars <- c("age", "race", "eth_hisp", "sex", "insurance", 
+          "bmi", "bmi_cat", "sbp", "dbp")
+factorVars <- c("race", "eth_hisp", "sex", "insurance", "bmi_cat")
+trt <- c("practice")
+
+table <- CreateTableOne(data = hbp, 
+                        vars = vars, 
+                        factorVars = factorVars,
+                        strata = trt)
+
+print(table, 
+      nonnormal = c("bmi"),
+      exact = c("eth_hisp", "sex"))
+```
+
+- Missing Data by Variable: `practice` = 0, `age` = 0, `race` = 31, `eth_hisp` = 34, `sex` = 0, `insurance` = 0, `bmi` = 7, `bmi_cat` = 7, `sbp` = 0, `dbp` = 0
+- `bmi` treated as non-normal since the value distribution is skewed right
+
+From our table, we can see a couple of important statistics about subjects in the Highland and Sycamore practices. The first thing is the average age, as the average age of Sycamore subjects is about 8.5 years older than that of Highland. Another big thing is racial breakdown, as Sycamore subjects are predominantly African-American while Highland is predominantly White. Similarly, Highland has a decent amount of ethnically Hispanic subjects (93) relative to Sycamore, who has 0. One last thing to notice is the primary insurance breakdown, where Highland's subjects are relatively diverse while Sycamore subjects only have Medicare or commercial insurance.
+
+
+# Question 2
+
+## Part A
+If the |$\beta$|/max|$\beta$| = 0.6, the plot suggests that there should be two variables included in the model: variable 1 and variable 2. This is because when |$\beta$|/max|$\beta$| = 0.6, the last vertical line prior to reaching 0.6 specifies that two variables should be included and by following the two lines, we can see that they are variables 1 and 2. 
+
+## Part B
+The plot suggests a model that leaves out exactly one predictor is when ~0.85 < |$\beta$|/max|$\beta$| < 1. We can determine this by finding where |$\beta$|/max|$\beta$| is between the vertical lines of having 4 and 5 variables, with the one predictor to be left out being variable 3 because it's the last variable to be included.
+
+
+# Session Information
+
+```{r}
+xfun::session_info()
+```
