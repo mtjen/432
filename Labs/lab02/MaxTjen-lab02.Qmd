@@ -1,0 +1,186 @@
+---
+title: "432: Lab 02"
+author: "Max Tjen"
+date: last-modified
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-overflow: wrap
+    embed-resources: true
+    date-format: iso
+    theme: default
+---
+
+## R Packages and Setup
+
+```{r}
+#| message: false
+#| warning: false
+
+knitr::opts_chunk$set(comment = NA) 
+
+library(janitor) 
+library(survey)
+library(broom)
+library(kableExtra)
+library(naniar)
+library(tidyverse) 
+
+theme_set(theme_bw())
+```
+
+
+# Question 1
+
+## Load Data
+
+```{r}
+#| message: false
+
+q1_data <- read_rds("/Users/mtjen/Desktop/432/labs/lab02/lab2q1.Rds") |>
+  clean_names()
+
+dim(q1_data)
+```
+
+Here, we ensure that our data has the right amount of subjects/rows.
+
+## Part A
+
+```{r}
+# get complete cases for general health and those who respond "Yes" to moderate-intensity sports
+q1_data <- q1_data |>
+  filter(complete.cases(hsd010)) |>
+  filter(paq665 == 1)
+
+# ensure acceptable general health values 
+table(q1_data$hsd010)
+
+num_rows_data <- nrow(q1_data)
+
+# get subjects who have a general health value of “Excellent” or “Very Good”
+num_healthy <- q1_data |>
+  filter(hsd010 == 1 | hsd010 == 2)
+
+num_rows_healthy <- nrow(num_healthy)
+
+percent <- num_rows_healthy / num_rows_data * 100
+rounded_percent <- round(percent, 1)
+rounded_percent
+```
+
+We subsetted our data to subjects who responded “Yes” to a moderate-intensity sports question and had a general health condition response. Among these respondents, 42.6% of them said that their health condition in general was either “Excellent” or “Very Good”.
+
+
+## Part B
+
+```{r}
+# create survey object
+part_b_survey <- svydesign(id = ~seqn, weights = ~wtint2yr, data = q1_data)
+part_b_survey <- update(part_b_survey, one = 1)
+
+# get weighted count values
+weighted_counts <- svyby(~one, ~hsd010, part_b_survey, svytotal)
+weighted_counts
+
+total_healthy <- weighted_counts["one"][1,] + 
+  weighted_counts["one"][2,]
+
+total_count <- weighted_counts["one"][1,] + 
+  weighted_counts["one"][2,] +
+  weighted_counts["one"][3,] + 
+  weighted_counts["one"][4,] + 
+  weighted_counts["one"][5,]
+
+weighted_percentage <- total_healthy / total_count * 100
+rounded_weighted_percent <- round(weighted_percentage, 1)
+rounded_weighted_percent
+```
+
+For part B, we incorporated sampling weights with the same subset of data from part A to investigate the same question. Once we accounted for the sample weights provided by the data, it was found that 48.0% of respondents said that their general health condition was either “Excellent” or “Very Good”. This is quite an increase from an unweighted value of 42.6% to a weighted value of 48.0%.
+
+
+# Question 2
+
+## Load Data
+```{r}
+#| message: false
+
+q2_data <- read_csv("/Users/mtjen/Desktop/432/labs/lab02/hbp3456.csv") |>
+  clean_names() |>
+  mutate(record = as.character(record)) |>
+  select(insurance, betab, sbp)
+
+dim(q2_data)
+```
+
+Here, we ensure that our data has the right amount of subjects/rows.
+
+## Part A
+
+```{r}
+#| message: false
+
+q2_data <- q2_data |> filter(complete.cases(q2_data))
+
+# sbp by insurance and betab variables
+predictor_summary <- q2_data |>
+  group_by(betab, insurance) |>
+  summarise(n = n(), mean = mean(sbp), stdev = sd(sbp))
+
+predictor_summary
+
+# create interaction plot to see if we want to use an interaction term
+ggplot(predictor_summary, aes(x = insurance, y = mean, col = factor(betab))) + 
+  geom_point(size = 2) +
+  geom_line(aes(group = factor(betab))) + 
+  labs(title = "Mean Systolic Blood Pressure by Insurance Status",
+       subtitle = "Adjust for Beta-Blocker Prescription")
+
+# create model without interaction term
+model <- lm(sbp ~ insurance + betab, data = q2_data)
+```
+From our interaction plot, we can determine that we shouldn't use an interaction term between the `insurance` and `betab` variables. It also appears that a person's insurance status doesn't seem to have a meaningful impact on their systolic blood pressure. This can be seen through all of the mean systolic blood pressure values by insurance type and presence of beta blocker prescription are relatively similar, with the range of mean values being roughly 131 to 135.
+
+## Part B
+
+```{r}
+glance(model) |>
+  select(r.squared, adj.r.squared, sigma) |>
+  kable(digits = c(3, 3, 2), align = "c")
+
+anova(model)
+
+tidy(model, conf.int = TRUE, conf.level = 0.90) |> 
+  select(term, estimate, std.error, conf.low, conf.high, p.value) |> 
+  kable(digits = 2, align = "c")
+
+relationships <- data.frame(
+  "Insurance" = c("Commercial", "Commercial", "Medicaid", "Medicaid",
+                  "Medicare", "Medicare", "Uninsured", "Uninsured"),
+  "Beta Blocker" = c("No", "Yes", "No", "Yes", 
+                     "No", "Yes", "No", "Yes"),
+  "Predicted SBP" = c("131.31", 
+                      "131.31 + 2.04 = 133.35", 
+                      "131.31 + 1.65 = 132.96", 
+                      "131.31 + 1.65 + 2.04 = 135.00",
+                      "131.31 + 0.06 = 131.37", 
+                      "131.31 + 0.06 + 2.04 = 133.41",
+                      "131.31 + 1.36 = 132.67", 
+                      "131.31 + 1.36 + 2.04 = 134.71")
+  )
+
+kable(relationships, align = "ccr")
+```
+
+For our initial dataset, we assumed that missing values for our variables of interest were missing completely at random, so a complete case analysis is appropriate for this question. Using the interaction plot of means in part A, we found that we shouldn't use an interaction term between `insurance` and `betab` for our model. This is because the two lines of mean values for if a subject had a prescription for a beta-blocker or not were more or less parallel, which means that the variables don't interact. Based on the glance() function, we can see that our model didn't fit very well. The raw $R^2$ and adjusted $R^2$ values were both very small, which means that `insurance` and `betab` don't explain the variance of `sbp` well at all in our model. This can also be seen through the sigma value of 16.47, which is somewhat large and signifies the standard error of residuals. With anova(), we can see again that a person's insurance type doesn't have statistical significance when predicting their `sbp`, although `betab` is statistically significant. Lastly, when looking at our coefficients, we can see how various scenarios affect the model's predicted `sbp` value. Overall, all of the coefficients were pretty small with the largest being `betabYes` with a value of 2.04. Once we took all of the coefficients into account, we can see that the range of predicted values is from 131.31 to 135.00, which isn't a large range of values considering that we are using various insurance types and the presence of a beta-blocker prescription as predictor variables.
+
+
+# Session Information
+
+```{r}
+xfun::session_info()
+```
