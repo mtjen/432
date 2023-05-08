@@ -1,0 +1,140 @@
+---
+title: "432: Lab 01"
+author: "Max Tjen"
+date: last-modified
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-overflow: wrap
+    embed-resources: true
+    date-format: iso
+    theme: default  ## change the theme if you prefer
+---
+
+## R Packages and Setup
+
+```{r}
+#| message: false
+#| warning: false
+
+knitr::opts_chunk$set(comment = NA) 
+
+library(janitor) 
+library(patchwork)
+library(kableExtra)
+library(broom)
+library(tidyverse) 
+
+theme_set(theme_bw())
+```
+
+## Loading the Data
+
+```{r}
+oh22 <- read_csv("/Users/mtjen/Desktop/432/labs/lab01/oh_counties_2022.csv", 
+                 show_col_types = FALSE) |>
+  clean_names() |>
+  mutate(fips = as.character(fips))
+
+dim(oh22)
+```
+
+As we can see, there are 88 counties, each with 44 variables.
+
+
+# Question 1
+
+```{r}
+#| message: false
+
+# make Hispanic a factor variable with bottom 50% of counties as 0 and top 50% of counties as 1
+data <- oh22 |> select(hispanic, food_insecure, insuff_sleep) |>
+  mutate(hispanic = case_when(
+                   hispanic < median(hispanic) ~ 0, TRUE ~ 1),
+           hispanic = factor(hispanic))
+
+ggplot(data, aes(x = food_insecure, y = insuff_sleep) ) +
+  geom_point(aes(color = hispanic)) +
+  geom_smooth(method = "lm", col = "red", se = FALSE) + 
+  facet_wrap(hispanic ~ ., labeller = "label_both") +
+  labs(title = "Relationship of a County's Percent of Residents who are
+       Food Insecure and Percent of Residents who get Insuffient Sleep
+       by the Percent of Residents who are of Hispanic/Latino Ethnicity",
+       x = "Percent of Residents who are Food Insecure",
+       y = "Percent of Residents who get Insuffient Sleep")
+```
+
+We split our data into two groups: one group of Ohio counties who are in the bottom 50% of Hispanic/Latino ethnicity resident percentage and another group of counties who are in the top 50%. With this split, we can see that the top 50% group has a clear linear relationship between resident percentage who are food insecure and who get insufficient sleep, which can be seen by how well the data points follow the line of best fit.
+
+
+# Question 2
+
+## Fitting `model1`
+
+```{r}
+model1 <- lm(obese_pct ~ food_env + median_income, data = oh22) 
+```
+
+Here, we build the first model to predict `obese_pct` using `food_env` and `median_income` as predictor variables.
+
+## Explaining the `food_env` coefficient
+
+```{r}
+tidy(model1, conf.int = TRUE, conf.level = 0.90) |> 
+  select(term, estimate, conf.low, conf.high) |> 
+  kable(dig = 4)
+```
+
+We can see that the value for the `food_env` coefficient is 0.0718. This means that for any value that is greater than 0, the obesity percentage predicted by the model increases by the value*0.0718. The 90% confidence interval is (-0.6944,	0.8379), which tells us that the actual `food_env` coefficient value will fall within that range 90% of the time. 
+
+## Checking Regression Assumptions for `model1`
+
+```{r}
+#| fig-height: 10
+#| fig-width: 10
+
+par(mfrow=c(2,2)); plot(model1); par(mfrow = c(1,1))
+```
+
+From these residual plots, there doesn't appear to be any glaring issues with our regression assumptions. To check linearity, we can look at the top left plot where there is a slight n shaped curve, but nothing too problematic. We can also assess residual normality using the top right plot, where we can see that there aren't any issues as the points follow the QQ line and there isn't a noticeable pattern. Similarly, there is no obvious pattern in the bottom left plot, which indicates that there isn't a significant issue with constant variance. One thing to note is that it appears to be sloping downwards once fitted values clears the 36 mark, which is where the majority of points are. Lastly, we can see in the bottom right plot that there aren't any points that are problematic in terms of leverage and influence. To potentially improve the model, we can add more variables that are relevant to `obese_pct`, which may help improve the model's predictions. There are three points (4, 5, 32) that appear to be slight outliers, but 4 and 5 appear to be alright since they still follow the QQ line quite closely. 32 deviates a bit from it however, which may signify that it may be a true outlier in our model. To evaluate county 32 more, we have to investigate our variables a bit more.
+
+```{r}
+oh22[32,] |> select(county, obese_pct, food_env, median_income)
+
+summary(oh22$obese_pct)
+summary(oh22$food_env)
+summary(oh22$median_income)
+```
+
+By looking at these summaries, we can see that Hancock County of Ohio has a very average median income, which means that this variable doesn't make the county an outlier. The county's access to healthy food value is very high (8.2), while the obesity percentage is relatively low (32.2). From before, we saw that the model's `food_env` coefficient was 0.0718, which means that the predicted obesity percentage of a county increases by the `food_env` value*0.0718, so a higher `food_env` should theoretically mean a higher `obese_pct`. This explains why the county is an outlier, as the county has a high `food_env` value but low `obese_pct`
+
+## Comparing `model1` to `model2`
+
+```{r}
+model2 <- lm(obese_pct ~ food_env, data = oh22) 
+
+one_result <- glance(model1) |> 
+  round(digits = 3) |>
+  mutate(modelname = "model1")
+
+two_result <- glance(model2) |>
+  round(digits = 3) |>
+  mutate(modelname = "model2")
+
+comparison <- bind_rows(one_result, two_result) |>
+  select(modelname, nobs, df, AIC, BIC, r.squared, adj.r.squared, sigma)
+
+comparison
+```
+
+Based on these metrics, it appears that model 1 (including median income) fits the data more effectively than model two. This can be determined using each scoring type, as model 1 has lower AIC, BIC, and residual standard error (sigma) values as well as higher $R^2$ and adjusted $R^2$ values. $R^2$/adjusted $R^2$ and sigma are important metrics to look at, as it evaluates how well the model predicted values. $R^2$ measures the proportion of variance explained by the predictor variables, so we can see that model 1 performed much better (albeit still not great) relative to model 2. Similarly, sigma is smaller for model 1 than model 2, so we can determine that the average residual value (absolute difference between the actual and predicted value) is smaller for model 1, which means that the predicted values are closer to the actual values.
+
+
+# Session Information
+
+```{r}
+xfun::session_info()
+```
