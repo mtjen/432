@@ -1,0 +1,789 @@
+---
+title: "Predicting Food Security and Amount of Pee Breaks per Night"
+author: "Max Tjen"
+date: last-modified
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-overflow: wrap
+    embed-resources: true
+    date-format: iso
+    theme: zephyr 
+---
+
+## R Packages and Setup {.unnumbered}
+
+```{r}
+#| message: false
+#| warning: false
+
+knitr::opts_chunk$set(comment = NA) 
+
+library(janitor) 
+library(nhanesA)
+library(naniar)
+library(broom)
+library(MASS)
+library(rms)
+library(simputation)
+library(nnet)
+library(pROC)
+library(pscl)
+library(yardstick)
+library(kableExtra)
+library(tidyverse)
+
+theme_set(theme_bw()) 
+```
+
+
+# Background
+
+For this project, we will be using National Health and Nutrition Examination Survey (NHANES) data that was collected from 2017-March 2020. The datasets used are demographics, alcohol use, diabetes, food security, income, and kidney conditions. 
+
+Our first outcome of interest is food security, which describes an adults food security category over the past 12 months. It's divided into four categories - very low, low, marginal, and full - and has been coded based on survey results. Full food security means that a subject scored 0 and has "had no problems, or anxiety about, consistently accessing adequate food". Marginal security means that a subject scored between 1-2 and has "had problems at times, or anxiety about, accessing adequate food, but the quality, variety, and quantity of their food intake were not substantially reduced". Low security means that a subject scored between 3-5 and has "reduced the quality, variety, and desirability of their diets, but the quantity of food intake and normal eating patterns were not substantially disrupted". Lastly, the very low category means that a subject scored between 6-10 and at "times during the year, eating patterns of one or more household members were disrupted and food intake reduced because the household lacked money and other resources for food". All quotes are courtesy of the United States Department of Agriculture. This interests me because of how large of an issue food security is in the United States, despite it never really being recognized as a problem. With that, I think that it's important to see if there's a way to predict someone's food security and identify if they may need help to put food on their plate.
+
+Our second outcome of interest is how many times someone has to urinate at night. This describes the average amount a patient has had to pee at night between going to bed and waking up over the past 30 days. I find this interesting because of how disruptive this can be throughout the night and how it disrupts your sleep cycles and quality of sleep. Additionally, I feel like you always hear about how these occurrences increase as you get older, so I'd like to see if the data agrees with this assumption.
+
+
+# Research Questions
+
+How well can we predict an adult's food security category using ethnicity, poverty index, and systolic blood pressure as predictors? 
+
+How well can we predict the average amount of times someone has to pee at night using age, alcohol intake, and systolic blood pressure as predictors? 
+
+
+# Data Ingest and Management
+
+## Loading the Raw Data and Variable Selection
+
+```{r}
+# load raw data
+demo <- nhanes('P_DEMO') |> tibble() |> 
+  select(SEQN, RIDAGEYR, RIDRETH3) |> clean_names()
+alcohol <- nhanes('P_ALQ') |> tibble() |> 
+  select(SEQN, ALQ130) |> clean_names()
+diabetes <- nhanes('P_DIQ') |> tibble() |> 
+  select(SEQN, DIQ300S) |> clean_names()
+food <- nhanes('P_FSQ') |> tibble() |> 
+  select(SEQN, FSDAD) |> clean_names()
+income <- nhanes('P_INQ') |> tibble() |> 
+  select(SEQN, INDFMMPI) |> clean_names()
+kidney <- nhanes('P_KIQ_U') |> tibble() |> 
+  select(SEQN, KIQ480) |> clean_names()
+
+# join data sets
+data <- left_join(demo, alcohol, by = "seqn")
+data <- left_join(diabetes, data, by = "seqn")
+data <- left_join(food, data, by = "seqn")
+data <- left_join(income, data, by = "seqn")
+data <- left_join(kidney, data, by = "seqn")
+```
+
+We begin by ingesting the raw datasets from the `nhanes` package datasets. At the same time, we also select the variables that we will be using and then join the individual datasets into one based on each subject's `seqn` value. 
+
+## Cleaning the Data
+
+### Changing Variable Names and Converting Variable Types
+
+```{r}
+data <- data |>
+  mutate(id = as.character(seqn),
+         pee = kiq480,
+         pov_index = indfmmpi,
+         food = as.factor(fsdad),
+         sbp = diq300s,
+         age = ridageyr,
+         ethnicity = as.factor(ridreth3),
+         avg_drinks = alq130) |>
+  select(-seqn, -kiq480, -indfmmpi, -fsdad, -diq300s, 
+         -ridageyr, -ridreth3, -alq130)
+```
+
+Here, we change some variable types and their names to be more descriptive.
+
+### Sampling the Data
+
+Our data contains some values that we need to filter out. First, we want to restrict our data to adults so we will filter on `age`. Next, `pee`, `sbp`, and `avg_drinks` have values that correspond to subjects either not knowing the value or refusing to answer the question, so we will also have to filter these.
+
+```{r}
+data <- data |>
+  filter(age >= 21) |> 
+  filter(age < 80) |>
+  filter(pee != 9 | is.na(pee) == TRUE) |>
+  filter(sbp != 7777 | is.na(sbp) == TRUE) |>
+  filter(sbp != 9999 | is.na(sbp) == TRUE) |>
+  filter(avg_drinks != 777 | is.na(avg_drinks) == TRUE) |>
+  filter(avg_drinks != 999 | is.na(avg_drinks) == TRUE)
+```
+
+### Working with Categorical Predictors
+
+```{r}
+data <- data |>
+  mutate(food_cat = factor(case_when(food == "1" ~ "Full",
+                                     food == "2" ~ "Marginal",
+                                     food == "3" ~ "Low",
+                                     food == "4" ~ "Very Low")),
+         ethnicity_cat = factor(case_when(
+           ethnicity == "1" ~ "Mexican American",
+           ethnicity == "2" ~ "Other Hispanic",
+           ethnicity == "3" ~ "Non-Hispanic White",
+           ethnicity == "4" ~ "Non-Hispanic Black",
+           ethnicity == "6" ~ "Non-Hispanic Asian",
+           ethnicity == "7" ~ "Other Race"))) |>
+   mutate(food_cat = fct_relevel(
+    food_cat, "Very Low", "Low", "Marginal", "Full"),
+    food_cat = factor(food_cat, ordered = TRUE)) |>
+  select(-food, -ethnicity)
+```
+
+Here, we make our categorical variable values more descriptive.
+
+### Checking Missingness
+
+Now, we will check the missingness of the data.
+
+```{r}
+# filter complete cases for both outcomes
+data <- data |> 
+  filter(complete.cases(food_cat)) |>
+  filter(complete.cases(pee))
+
+miss_var_summary(data)
+```
+
+Because `sbp` has a very high percentage of missing values, we will drop these missing observations. This is because imputation relies on the existing values, so there wouldn't be a ton of data to base the estimated values on. 
+
+```{r}
+data <- data |>
+  filter(is.na(sbp) == FALSE)
+```
+
+### Arranging the Tibble
+
+To make our tibble more readable, we will move our outcome variables to the far right.
+
+```{r}
+data <- data |> 
+  relocate(food_cat, .after = last_col()) |>
+  relocate(pee, .after = last_col())
+```
+
+## Print and Save The Final Tibble
+
+```{r}
+data
+
+saveRDS(data, "/Users/mtjen/Desktop/432/projectB/projB_data.Rds")
+```
+
+We will now print and save our final tibble.
+
+
+# Code Book and Description
+
+## Defining the Variables
+
+The following is our code book to help define variables in our data.
+
+ Variable | Role | Type | Description
+--------- | ---- | ---- | ------------
+ `id` | identifier | character | subject identifier
+ `pov_index` | input | quantitative | family monthly poverty level index
+ `sbp` | input | quantitative | most recent systolic blood pressure reading
+ `age` | input | quantitative | age of subject in years at time of screening
+ `avg_drinks` | input | quantitative | average number of alcoholic drinks per day the past 12 months
+ `ethnicity_cat` | input | categorical (6) | race/hispanic origin [Mexican American, Other Hispanic, Non-Hispanic White, Non-Hispanic Black, Non-Hispanic Asian, Other Race]
+ `food_cat` | outcome | ordinal (4) | adult food security category the past 12 months [Very Low, Low, Marginal, Full]
+ `pee` | outcome | count | typical amount of urination trips between going to sleep and waking up the past 30 days
+ 
+## Numerical Description
+
+Next, we will look at quick numerical summaries/descriptions of our variables.
+
+```{r}
+Hmisc::describe(data)
+```
+
+
+# Analyses
+
+## Train/Test Split 
+
+We will split our data into training and testing datasets, which allows us to validate our final models on unseen data later.
+
+```{r}
+set.seed(12321)
+
+# get train and test groups
+train_data <- slice_sample(data, n = 500)
+test_data <- anti_join(data, train_data, by = "id")
+
+# check dimensions
+dim(data)
+dim(train_data)
+dim(test_data)
+```
+
+
+## Analysis 1
+
+### Research Question
+
+How well can we predict an adult's food security category in the past 12 months using ethnicity, poverty index, and systolic blood pressure as predictors? 
+
+### Data Selection
+
+```{r}
+# subset data
+a1_train <- train_data |>
+  select(ethnicity_cat, pov_index, sbp, food_cat) 
+```
+
+Here, we subset our overall data for just the variables needed in analysis 1.
+
+### Missingness
+```{r}
+# check missingness
+miss_var_summary(a1_train)
+```
+
+After looking at our missing data summary, we see that we are missing about 14% of values for `pov_index`. We will account for this by using simple imputation to estimate values for those missing observations.
+
+### Simple Imputation
+
+```{r}
+# imputation - predictive mean matching
+a1_train <- a1_train |>
+  impute_pmm(pov_index ~ ethnicity_cat + food_cat)
+
+miss_var_summary(a1_train)
+```
+
+Due to missingness, we must impute values for `pov_index`. To do so, we used predictive mean matching based on `ethnicity_cat` and `food_cat`.
+
+### Outcome Distribution
+
+```{r}
+summary(a1_train$food_cat)
+
+ggplot(a1_train, aes(x = food_cat, fill = food_cat)) +
+  geom_bar() +
+  labs(title = "Distribution of Food Security Categories",
+       x = "Food Security Category",
+       y = "Count") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_brewer(palette = "BuPu")
+```
+
+By visualizing the distribution of our outcome variable `food_cat`, we can see that a lot of the subjects are within the full category. The other three categories - very low, low, marginal, and full - all have similar counts.
+
+### Outcome Distribution by Predictors
+
+#### Ethnicity
+
+```{r}
+ggplot(a1_train, aes(x = food_cat, fill = food_cat)) +
+  geom_bar() +
+  facet_wrap(~ ethnicity_cat) +
+  labs(title = "Distribution of Food Security Categories by Ethnicity",
+       x = "Food Security Category",
+       y = "Count") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_brewer(palette = "BuPu")
+```
+
+By breaking down the data by ethnicity, we can see that non-hispanic black and non-hispanic white are particularly imbalanced, as they have lots of subjects within the full category. Overall though, all of the categories' most frequent food security category is full.
+
+#### Poverty Index
+
+```{r}
+ggplot(a1_train, aes(x = food_cat, y = pov_index, fill = food_cat)) +
+  geom_violin() +
+  geom_boxplot(width = 0.15, fill = "White") +
+  labs(title = "Poverty Index by Food Security Category",
+       x = "Food Security Category",
+       y = "Poverty Index") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_brewer(palette = "BuPu") 
+```
+
+With this plot, we can see that the low and marginal food security categories have similar right skew distributions and quartile values of poverty index. The very low security category has a similar median as those two, although the quartile values are lower and the values are more right skewed. The full category has a relatively uniform poverty index distribution, but the quartile poverty index values are much higher than the other three categories. 
+
+#### Systolic Blood Pressure
+
+```{r}
+ggplot(a1_train, aes(x = food_cat, y = sbp, fill = food_cat)) +
+  geom_violin() +
+  geom_boxplot(width = 0.15, fill = "White") +
+  labs(title = "SBP by Food Security Category",
+       x = "Food Security Category",
+       y = "Systolic Blood Pressure") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_brewer(palette = "BuPu")
+```
+
+The quartile `sbp` values for each group are quite similar, with the very low category having a slightly higher 3rd quartile value. The value distributions for very low, low, and marginal are all relatively normal, with full being right skewed. 
+
+### Non-Linearity
+
+```{r}
+summary(a1_train$food_cat)
+
+summary(a1_train$ethnicity_cat)
+```
+
+Because our smallest outcome category (very low) has 55 observations, the maximum degrees of freedom we can use is 6. However, we currently have 7, so we will collapse the ethnicity group  values to be Non-Hispanic Asian, Non-Hispanic Black, Non-Hispanic White, and Other.
+
+```{r}
+a1_train <- a1_train |> 
+  mutate(ethnicity_cat = fct_collapse(ethnicity_cat,
+                                      "Other" = c("Mexican American", 
+                                                  "Other Hispanic", 
+                                                  "Other Race")))
+
+summary(a1_train$ethnicity_cat)
+```
+
+### Proportional Odds Logistic Regression
+
+```{r}
+# distribution
+dist <- datadist(a1_train)
+options(datadist = "dist")
+
+# Create Model
+mod1_lrm <- lrm(food_cat ~ ethnicity_cat + pov_index + sbp,
+                data = a1_train, x = TRUE, y = TRUE)
+
+mod1_lrm
+```
+
+Here, we fit our proportional odds logistic regression model using lrm(), where we can see that our Nagelkerke $R^2$ = 0.338 and the C statistic is 0.780. 
+
+### Multinomial Logistic Regression
+
+```{r}
+# Create Model
+mod1_multi <- multinom(food_cat ~ ethnicity_cat + pov_index + sbp,
+                       data = a1_train, trace = FALSE)
+
+mod1_multi
+```
+
+Here, we create our multinomial model with the same main effects.
+
+### Model Comparison
+
+```{r}
+# likelihood ratio test
+lrm_logLik <- logLik(mod1_lrm)[1]
+multi_logLik <- logLik(mod1_multi)[1]
+
+# calculate p-value
+pchisq(-2 * (lrm_logLik - multi_logLik),
+       df = 10, lower.tail = FALSE)
+
+# AIC values for each model
+AIC(mod1_lrm)
+AIC(mod1_multi)
+```
+
+To compare the fit of these two models, a likelihood ratio test was used along with comparing AIC values. For the likelihood ratio test, we first had to find the degrees of freedom to use, which was 10. This was found by getting the difference in parameters between the models, which were 8 for the lrm model and 18 for the multinomial model, resulting in a difference of 10. The outputted p-value was 0.104, indicating no meaningful difference between the two models. Because of this, we then looked at the AIC values for the two models. These are also very similar, with the lrm model having a slightly better score. All of this implies that our proportional odds assumption is reasonable and that we can safely assume proportional odds and move forward with the lrm model.
+
+### Final Model - Proportional Odds
+
+```{r}
+mod1_lrm$coefficients
+
+summary(mod1_lrm)
+
+plot(summary(mod1_lrm))
+```
+
+As suggested by the coefficients before, `pov_index` has a very large effect size while the other variables' effect size odds ratios stay relatively close to 1.
+
+```{r}
+func_low <- function(x) plogis(x - mod1_lrm$coef[1] + mod1_lrm$coef[2])
+func_marg <- function(x) plogis(x - mod1_lrm$coef[1] + mod1_lrm$coef[3])
+func_full <- function(x) plogis(x - mod1_lrm$coef[1] + mod1_lrm$coef[4])
+
+# nomogram
+plot(nomogram(mod1_lrm, fun = list('Pr(Very Low)' = plogis, 
+                                   'Pr(Low)' = func_low,
+                                   'Pr(Marginal)' = func_marg,
+                                   'Pr(Full)' = func_full),
+              abbrev = TRUE),
+     cex.axis = 0.55)
+```
+
+```{r}
+ggplot(Predict(mod1_lrm, fun = Mean(mod1_lrm, code = TRUE)))
+```
+
+From these mean prediction plots, we can see that the mean predictions for `ethnicity_cat` and `sbp` are relatively similar across various values. For `ethnicity_cat`, it looks like the other category has the smallest average prediction value while non-hispanic asian has the highest, although the 95% confidence intervals have lots of overlap. For `sbp`, the predicted values are pretty much the same across all `sbp` values. The one variable that shows lots of difference is `pov_index`, particularly among those with an index value less than 3. For values less than 3, the predictive value goes up quite significantly as the index value increases, demonstrating how influential it is to the value predictions. Once the index value is above 3 though, the mean value predictions stay relatively constant.
+
+### Model Validation
+
+```{r}
+set.seed(12321)
+
+validate(mod1_lrm)
+
+0.5470/2 + 0.5
+```
+
+By validating our training model with the same training data, we get a validated Nagelkerke $R^2$ = 0.324 and C statistic of 0.774, which is still decent.
+
+### Test Data
+
+```{r}
+# perform same steps done on training data on test data
+a1_test <- test_data |>
+  select(ethnicity_cat, pov_index, sbp, food_cat) |>
+  impute_pmm(pov_index ~ ethnicity_cat + food_cat) |>
+  mutate(ethnicity_cat = fct_collapse(ethnicity_cat,
+                                      "Other" = c("Mexican American", 
+                                                  "Other Hispanic", 
+                                                  "Other Race")))
+
+# make predictions
+m1_predictions <- predict(mod1_lrm, 
+                          newdata = as.data.frame(a1_test),
+                          type = "fitted.ind")
+
+head(m1_predictions)
+```
+
+We can now move to our test data, where we can get the estimated food security category probabilities for each subject.
+
+```{r}
+# function to find highest probability category for each subject
+get_pred_cat <- function(category_predictions) {
+  cat_preds <- c()      # vector to hold highest probability category
+
+  # iterate through predictions
+  for (index in 1:dim(category_predictions)[1]) {
+    vals <- category_predictions[index,]
+    label <- "Very Low"
+    
+    if ((vals[1] < vals[2]) == TRUE) {
+      win1 <- vals[2]
+      label <- "Low"
+    }
+    else {
+      win1 <- vals[1]
+    }
+    
+    if ((win1 < vals[3]) == TRUE) {
+       win2 <- vals[3]
+      label <- "Marginal"
+    }
+    else {
+      win2 <- win1
+    }
+    
+    if ((win2 < vals[4]) == TRUE) {
+      label <- "Full"
+    }
+    cat_preds <- append(cat_preds, label)   # append category
+  }
+  
+  return(cat_preds)
+}
+
+
+preds <- get_pred_cat(m1_predictions)
+
+# show output
+head(m1_predictions, 10)
+head(preds, 10)
+
+multi_roc <- a1_test |>
+  mutate(pred = preds) |>                  # add predictions
+  mutate(pred = as.numeric(case_when(
+    pred == "Very Low" ~ 0,                # make values numeric for function
+    pred == "Low" ~ 1,
+    pred == "Marginal" ~ 2,
+    pred == "Full" ~ 3)))
+
+# get ROC
+multiclass.roc(multi_roc$food_cat ~ multi_roc$pred, 
+               direction = "<")
+```
+
+We can also look at the C statistic for the test data, which isn't great at 0.5958. To get this, we first had to find which food security category had the highest odds was most likely and then add these predictions to our test data. Then we could run the multiclass.roc function and get a result.
+
+```{r}
+mod1_polr <- polr(food_cat ~ ethnicity_cat + pov_index + sbp,
+                  data = a1_train, Hess = TRUE)
+
+results_1 <- addmargins(table(predict(mod1_polr, newdata = as.data.frame(a1_test)),
+                              a1_test$food_cat))
+
+results_1
+
+(9+130)/228 * 100
+```
+
+By creating a polr model and running a classification table on the test data, we can calculate that the model correctly predicted 61.0% of the test data. We can also see that our model only predicts that the test observations will be in either very low or full. This is likely due to `pov_index` being an influential variable and the others not impacting prediction scores much. As such, the model almost becomes dependent on the values of one predictor.
+
+
+## Analysis 2
+
+### Research Question
+
+How well can we predict the average amount of times someone has to pee at night using age, alcohol intake, and systolic blood pressure as predictors? 
+
+### Data Selection
+
+```{r}
+# subset data
+a2_train <- train_data |>
+  select(age, avg_drinks, sbp, pee)
+```
+
+Here, we subset our overall data for just the variables needed in analysis 2.
+
+
+### Missingness
+
+```{r}
+# check missingness
+miss_var_summary(a2_train)
+```
+
+By checking our missing values, we can see that the only variable that has missingness is `avg_drinks`, which is missing 205 (41%) of values.
+
+### Simple Imputation
+
+```{r}
+# imputation - predictive mean matching
+a2_train <- a2_train |>
+  impute_pmm(avg_drinks ~ age + sbp)
+
+miss_var_summary(a2_train)
+```
+
+Due to missingness, we must impute values for `avg_drinks`. To do so, we used predictive mean matching based on `age` and `sbp`.
+
+### Outcome Distribution
+
+```{r}
+summary(a2_train |> mutate(pee = factor(pee)) |> select(pee))
+
+ggplot(a2_train, aes(x = factor(pee), fill = factor(pee))) +
+  geom_bar() +
+  labs(title = "Distribution of Pee Breaks per Night",
+       x = "Amount of Breaks",
+       y = "Count") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_brewer(palette = "Spectral")
+```
+
+From this graph, we can see that the distribution of `pee` is relatively normal, with one and two being the most frequent amounts of pee breaks per night.
+
+### Outcome Distribution by Predictors
+
+#### Age
+
+```{r}
+ggplot(a2_train, aes(x = factor(pee), y = age, fill = factor(pee))) +
+  geom_violin() +
+  geom_boxplot(width = 0.2, fill = "White") +
+  labs(title = "Age by Pee Breaks per Night",
+       x = "Pee Breaks per Night",
+       y = "Age") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_brewer(palette = "Spectral") +
+  coord_flip()
+```
+
+It appears that for each of the pee break count categories except for 0, the data is pretty normal with various degrees of left skew. For the 0 breaks group, the data looks normally distributed without much skew. 
+
+#### Average Alcoholic Drinks per Day
+
+```{r}
+ggplot(a2_train, aes(x = factor(avg_drinks), fill = factor(avg_drinks))) +
+  geom_bar() +
+  facet_wrap(.~ factor(pee)) +
+  labs(title = "Distribution of Alcoholic Drinks per Day by Pee Breaks per Night",
+       x = "Amount of Alcoholic Drinks per Day",
+       y = "Count") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_brewer(palette = "Spectral")
+``` 
+
+From the faceted plot, we can see that for most of the pee break count categories, counts are heavily weighted towards those who have one or two drinks per day.
+
+#### Systolic Blood Pressure
+
+```{r}
+ggplot(a2_train, aes(x = factor(pee), y = sbp, fill = factor(pee))) +
+  geom_violin() +
+  geom_boxplot(width = 0.2, fill = "White") +
+  labs(title = "SBP by Pee Breaks per Night",
+       x = "Pee Breaks per Night",
+       y = "Systolic Blood Pressure") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_brewer(palette = "Spectral") + coord_flip()
+```
+
+For all the pee break count categories, the systolic blood pressure distributions are pretty normal with 5 looking relatively uniform. The quartile values for 0-3 are all quite similar, with 4's values being slightly lower and 5 having a wider inter-quartile range.
+
+### Non-Linearity
+
+```{r}
+# build spearman object
+mod2_spear <- spearman2(pee ~ age + avg_drinks + sbp, 
+                        data = a2_train)
+
+plot(mod2_spear)
+```
+
+Given that our outcome is a count variable and we have 500 observations in our training data, we have a maximum of 12 degrees of freedom available. With our result, we will try fitting a 3 knot cubic spline on `avg_drinks` and a 3 knot cubic spline on `age`.
+
+```{r}
+mod2_nonlin <- glm(pee ~ rcs(age, 3) + rcs(avg_drinks, 3) + sbp, 
+                   data = a2_train, family = "poisson")
+
+anova(mod2_nonlin, test = "Chisq")
+```
+
+By testing these new non-linear predictor terms, we can see that `avg_drinks` with a 3 knot cubic spline is the only term that adds significant predictive value to the model given the other predictors.
+
+### Poisson Regression
+
+```{r}
+#| warning: false
+
+mod2_poi <- glm(pee ~ rcs(avg_drinks, 3) + age + sbp, 
+                data = a2_train, family = "poisson")
+
+tidy(mod2_poi) |> 
+  select(term, estimate, std.error, p.value) |> 
+  kable(digits = 3)
+
+countreg::rootogram(mod2_poi)
+```
+
+We can see from the rootogram of the poisson regression model that the model fits pretty well, with there not being too much under/over prediction for each count category. It overfits counts of 0, 1, and 4 and underfits counts of 2, 3, and 5. 
+
+### Zero-Inflated Poisson Model
+
+```{r}
+#| warning: false
+
+mod2_zip <- pscl::zeroinfl(pee ~ rcs(avg_drinks, 3) + age + sbp,
+                           data = a2_train)
+
+summary(mod2_zip)
+
+countreg::rootogram(mod2_zip)
+```
+
+The rootogram of the zero inflated poisson regression model is very similar to that of the regular poisson regression model and again fits pretty well. Similar to before, it overfits counts of 0, 1, and 4 and underfits counts of 2, 3, and 5. 
+
+### Model Comparison
+
+```{r}
+# Vuong test
+vuong(mod2_poi, mod2_zip)
+```
+
+As seen before, the rootograms for the two models look nearly identical, indicating that they may perform very similarly. To confirm, we ran a Vuong test, where we saw that there is some evidence that the zero-inflated model fits better. However, the p-value suggests that the difference is not to a statistically detectable degree so we will move forward with the poisson regression model.
+
+### Final Model - Poisson Regression
+
+```{r}
+#| warning: false
+
+tidy(mod2_poi) |> 
+  select(term, estimate, std.error, p.value) |> 
+  kable(digits = 3)
+
+mod2_aug <- augment(mod2_poi, a2_train, 
+                    type.predict = "response")
+
+mets <- metric_set(rsq, rmse, mae)
+
+mets(mod2_aug, truth = pee, estimate = .fitted) |>
+  kable(digits = 3)
+```
+
+We can now look at how our final model performs on the training data, where we get an $R^2$ of 0.037, root mean square error of 1.290, and mean absolute error of 1.030.
+
+### Model Validation
+
+```{r}
+a2_test <- test_data |>
+  select(age, avg_drinks, sbp, pee) |>
+  impute_pmm(avg_drinks ~ age + sbp)
+
+mod2_aug_test <- augment(mod2_poi, newdata = a2_test, 
+                         type.predict = "response")
+
+mets(mod2_aug_test, truth = pee, estimate = .fitted) |>
+  kable(digits = 3)
+```
+
+After validating our model with the test data, we get an $R^2$ of 0.028, root mean square error of 1.316, and mean absolute error of 1.068. While these values are all slightly worse than the training results, they are all very similar, suggesting that our model will hold up and still be effective with new data.
+
+
+# Conclusions and Discussion
+
+## Answering My Research Questions 
+
+### Analysis 1 Conclusion
+
+Our research question was: how well can we predict an adult's food security category in the past 12 months using ethnicity, poverty index, and systolic blood pressure as predictors? Once we validated our final model using test data, it became evident that our model wasn't very robust and didn't perform very well. We got a multi-category ROC score of 0.5958 and an accuracy of 61.0%, indicating that our model wasn't very good and was doing slightly better than guessing. Looking more at the model predictions, we can see that it only predicted values subjects to be in either the very low or full category, ignoring low and marginal. This is likely because only `pov_index` seemingly provided any predictive value, and the coefficient for it was quite large. 
+
+### Analysis 1 Discussion
+
+Most of the modeling issues we had was likely down to our small sample size, where we had a total of 728 subjects in our data and then subsetted it to 500 for the training data. With this, the model didn't have a ton of data to use during development. Additionally, we used simple imputation for missing values, which may not have provided the most representative values for those missing. This may not be a huge factor though, as there were only 71 missing values in our training data, all being from `pov_index`. To improve this, we could use multiple imputation to get more accurate or representative values relative to the rest of the data. Another limitation was how there were a couple of `ethnicity_cat` categories that didn't have many observations. As such, we had to merge some of them together so that the category's were more balanced. We also were limited to 6 degrees of freedom for our predictors, so we didn't check for possible non-linear terms. Finally, the easiest and most influential thing that can be done to improve our predictions would be to select more useful predictor variables. Two of our three predictors (ethnicity and systolic blood pressure) didn't appear to contribute much to the model, which can particularly be seen in the mean prediction plots. The various values for each didn't move the needle in one way or another in terms of helping the model determine the subject's food security category. As such, by choosing better variables that help indicate one's food security, we will be able to obtain better predictions. 
+
+### Analysis 2 Conclusion
+
+Our research question was: how well can we predict the average amount of times someone has to pee at night using age, alcohol intake, and systolic blood pressure as predictors? The rootogram for our model fit pretty good overall, with there not being too much under/over fitting for any count value. After validating the poisson regression model, we can conclude that our model will likely still hold up with new data. Our validated results were very similar to training results, which points to our model holding up well with new and unseen data. With these results, we can conclude that age, daily alcohol intake, and systolic blood pressure are decently good predictors to predict the average amount of times someone has to pee at night. 
+
+### Analysis 2 Discussion
+
+Given how well the holdout data performed with the trained model, there aren't many caveats that we have about our model. One thing that may affect our performance is that our overall dataset (train and test) is relatively small (728 total), which may mean that our data isn't completely representative in general. A larger limitation as to our model's validity is regarding our imputation usage. We used simple imputation, which may not have been as effective as multiple imputation. For importantly though, we were missing 41% of values for `avg_drinks` in our training data and ~45% in our test data. With this, roughly half the values for each dataset is imputed, meaning that our values may not be the most representative of the actual distribution of average alcoholic drinks had per day for the past 12 months.
+
+### Project Lessons
+
+Throughout this project, I think that there are two main things that I learned. The first is with working with multi-categorical predictors and the types of plots that can be created to help visualize predictions. Next, I learned a lot about using multiple imputation for various models, which I was working to do at first in this project.
+
+
+# References and Acknowledgments
+
+## References
+
+Here are our links to the datasets used for the project. Please note that while it says the data is from 2017-2018, the webpage says it's from 2017-March 2020.
+
+- Demographics - <https://wwwn.cdc.gov/Nchs/Nhanes/2017-2018/P_DEMO.htm>
+- Alcohol Use - <https://wwwn.cdc.gov/Nchs/Nhanes/2017-2018/P_ALQ.htm>
+- Diabetes - <https://wwwn.cdc.gov/Nchs/Nhanes/2017-2018/P_DIQ.htm>
+- Food Security - <https://wwwn.cdc.gov/Nchs/Nhanes/2017-2018/P_FSQ.htm>
+- Income - <https://wwwn.cdc.gov/Nchs/Nhanes/2017-2018/P_INQ.htm>
+- Kidney Conditions - <https://wwwn.cdc.gov/Nchs/Nhanes/2017-2018/P_KIQ_U.htm>
+
+We also looked at the US Department of Agriculture for more details regarding food security.
+
+<https://www.ers.usda.gov/topics/food-nutrition-assistance/food-security-in-the-u-s/measurement/>
+
+
+## Acknowledgments
+
+I would like to thank Dr. Thomas Love for his teaching and guidance throughout the past two semesters. I would also to thank the Case Western Reserve University Department of Population and Quantitative Health Sciences for providing resources for this endeavor.
+
+
+# Session Information
+
+```{r}
+xfun::session_info()
+```
