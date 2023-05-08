@@ -1,0 +1,200 @@
+---
+title: "432: Lab 03"
+author: "Max Tjen"
+date: last-modified
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-overflow: wrap
+    embed-resources: true
+    date-format: iso
+    theme: default
+---
+
+## R Packages and Setup
+
+```{r}
+#| message: false
+#| warning: false
+
+knitr::opts_chunk$set(comment = NA) 
+
+library(janitor) 
+library(naniar)
+library(rms)
+library(kableExtra)
+library(tidyverse) 
+
+theme_set(theme_bw())
+```
+
+
+# Question 1
+
+```{r}
+#| message: false
+
+# load data
+hbp3456 <- read_csv("/Users/mtjen/Desktop/432/labs/lab03/hbp3456.csv") |>
+  clean_names() |>
+  mutate(record = as.character(record))
+
+# see missingness for each variable
+miss_var_summary(hbp3456)
+
+# part 1 - remove subjects with missing values for hsgrad or income
+hbp3456 <- hbp3456 |>
+  filter(complete.cases(hsgrad)) |> 
+  filter(complete.cases(income))
+
+# check missingness for each variable after removing some subjects
+miss_var_summary(hbp3456)
+
+# part 2 - restrict data to necessary variables
+hbp3456 <- hbp3456 |>
+  select(record, hsgrad, race, eth_hisp, age, tobacco, income)
+
+# print head of data to ensure it's the necessary variables
+head(hbp3456)
+
+# part 3 - change variables of character type to factors
+hbp3456 <- hbp3456 |>
+  mutate(race = as.factor(race)) |> 
+  mutate(eth_hisp = as.factor(eth_hisp)) |> 
+  mutate(tobacco = as.factor(tobacco))
+
+# ensure correct variable types
+head(hbp3456)
+
+# part 4 - create new variable sqrtinc to be our response variable
+hbp3456 <- hbp3456 |>
+  mutate(sqrtinc = sqrt(income))
+
+# ensure new variable has been created correctly
+head(hbp3456)
+
+# select 1,000 random subjects from the tibble with a seed of 432
+set.seed(432)
+hbp_b <- hbp3456 |>
+  slice_sample(n = 1000)
+
+# print resulting tibble to ensure correctness
+hbp_b
+
+# question 1 part - see amount of missing values for our predictor and outcome variables 
+miss_var_summary(hbp_b |> select(-record, -income))
+```
+
+Here, we do our preliminary work on our data to create a tibble that we will use for this lab. Once we've finalized the tibble, we look at the amount of missing values we have for each important variable (predictor and outcome variables). In that table, we can see that `eth_hisp` and `race` are both missing a decent amount of values (~3%), while all the other variables are alright.
+
+
+# Question 2
+
+```{r}
+# create spearman plot to see which variables may be good to make non-linear
+spearman_obj <- spearman2(sqrtinc ~ hsgrad + race + eth_hisp + age + tobacco, 
+                           data = hbp_b)
+
+plot(spearman_obj)
+```
+
+From this Spearman $\rho^2$ plot, we can see that if we want to use a non-linear term, `hsgrad` would clearly be the best choice. This is because higher scores indicate a variable performing better as a non-linear term and `hsgrad` has the highest Adjusted $\rho^2$ value by a wide margin.
+
+
+# Question 3
+
+```{r}
+# create OLS model
+dd <- datadist(hbp_b)
+options(datadist = "dd")
+
+m1 <- ols(sqrtinc ~ hsgrad + race + eth_hisp + age + tobacco, 
+                           data = hbp_b, x = TRUE, y = TRUE)
+
+# plot the model
+plot(summary(m1))
+
+# get coefficients of linear model
+m1_lm <- lm(sqrtinc ~ hsgrad + race + eth_hisp + age + tobacco, 
+                           data = hbp_b)
+
+m1_lm
+
+# ensure model has 8 degrees of freedom
+anova(m1)
+```
+
+The `hsgrad` coefficient shown in the effect summary plot indicates how much the predicted `sqrtinc` value will be affected by a change in `hsgrad` value from 75 to 90. The values 75 and 90 are specified because they are the 25th and 75th percentile values of `hsgrads`. With this point estimate, we can determine that the change in `sqrtinc` value for if `hsgrad` changes from 75 to 90 is ~37 if all else is held constant. This can be verified by calculating the actual difference using the `hsgrad` coefficient of 2.4341, where we can see that (2.4341 * 90) - (2.4341 * 75) = 36.5115.
+
+
+# Question 4
+
+```{r}
+# create OLS model
+dd <- datadist(hbp_b)
+options(datadist = "dd")
+
+
+m2 <- ols(sqrtinc ~ rcs(hsgrad, 4) + race + eth_hisp + age + tobacco, 
+                           data = hbp_b, x = TRUE, y = TRUE)
+
+# plot the model
+plot(summary(m2))
+
+# get coefficients of linear model
+m2_lm <- lm(sqrtinc ~ rcs(hsgrad, 4) + race + eth_hisp + age + tobacco, 
+                           data = hbp_b)
+
+m2_lm
+
+# ensure model has 10 degrees of freedom (2 non linear)
+anova(m2)
+```
+
+Interpreting the `tobacco` variable in this plot is a bit different from `hsgrad` before because it is a categorical variable. We know this because there are three levels of values: "Never", "Former", and "Current". For this plot, we can see that the common factor in each of the coefficients is "Never", which means that it is the level that the other two are being compared to. This means that "tobacco - Current:Never" is comparing the difference in predicted `sqrtinc` if one's tobacco status is "Current" instead of "Never", and similarly for "tobacco - Current:Former". The point estimate for "tobacco - Current:Never" is roughly -8 and roughly -4 for "tobacco - Current:Former". This means that with all other variables held constant, someone who is a "Current" tobacco user will have a predicted `sqrtinc` that is around 8 points lower than someone who has never used tobacco Similarly, a "Former" smoker will have a predicted `sqrtinc` that is around 4 points lower than someone who has never used tobacco This can be confirmed through seeing the actual coefficients from lm() where we can see that tobaccoNever's coefficient is 8.8 points higher than the baseline of tobaccoCurrent. tobaccoFormer's coefficient is 4.7 points higher than the baseline of tobaccoCurrent, meaning that the difference in predicted points is 4.7. This reiterates our rough measurements from the graph, as the difference betweeen "Current" and "Former" is roughly, 4 - 8, or -4.
+
+
+# Question 5
+
+```{r}
+# get AIC values
+AIC(m1)
+AIC(m2)
+
+# get BIC values
+BIC(m1)
+BIC(m2)
+
+# set seed for validation
+set.seed(2023)
+
+# validate models
+validate(m1, B = 40)
+validate(m2, B = 40)
+```
+
+```{r}
+# create table
+validation_table <- data.frame(
+  "Model" = c("Model 1", "Model 2"),
+  "Uncorrected R^2" = c(0.624, 0.675),
+  "AIC" = c(9126.345, 8990.198),
+  "BIC" = c(9174.973, 9048.551),
+  "Validated R^2" = c(0.613, 0.670),
+  "Validated MSE" = c(816.027, 710.532)
+  )
+
+kable(validation_table, align = "c")
+```
+
+From the table, we can see that that model 2 (with a non-linear term) performed better than model 1 in terms of every metric. Model 2 has a higher uncorrected and validated $R^2$ value, which means that it is better, along with having lower AIC, BIC, and validated MSE values, which also mean that it performed better than model 1.
+
+
+# Session Information
+
+```{r}
+xfun::session_info()
+```
