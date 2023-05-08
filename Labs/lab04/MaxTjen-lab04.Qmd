@@ -1,0 +1,242 @@
+---
+title: "432: Lab 04"
+author: "Max Tjen"
+date: last-modified
+format: 
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    code-overflow: wrap
+    embed-resources: true
+    date-format: iso
+    theme: default
+---
+
+## R Packages and Setup
+
+```{r}
+#| message: false
+#| warning: false
+
+knitr::opts_chunk$set(comment = NA) 
+
+library(janitor) 
+library(knitr)
+library(broom)
+library(rms)
+library(tidyverse) 
+
+theme_set(theme_bw())
+```
+
+
+# Question 1
+
+```{r}
+#| message: false
+
+# load data
+oh22 <- read_csv("/Users/mtjen/Desktop/432/labs/lab01/oh_counties_2022.csv") |>
+  clean_names() |>
+  mutate(fips = as.character(fips))
+
+# convert "No" and "Yes" values to 0 and 1
+oh22 <- oh22 |>
+  mutate(h2oviol = case_when(h2oviol == "No" ~ 0, TRUE ~ 1))
+
+# create logistic regression model
+model <- glm(h2oviol ~ sev_housing + pm2_5, data = oh22,
+             family = binomial(link = "logit"))
+
+# get confidence interval
+tidy(model, exponentiate = TRUE, conf.int = TRUE, conf.level = 0.90) |>
+  select(term, estimate, conf.low, conf.high) |>
+  filter(term == "sev_housing")
+```
+
+The coefficient for `sev_housing` also represents the estimated odds ratio, which we can see is 0.958 with a 90% confidence interval of (0.788, 1.150). This means that the odds of an Ohio county having a water violation is 0.958 times as likely when `sev_housing` increases by one unit with all other variables held constant. However, the 90% confidence interval includes 1, which means that we can't be fully sure about the true effect direction of `sev_housing` on `h2oviol`. If the true value is greater than 1, then it would mean that the odds of `h2oviol` = 1 increases as `sev_housing` increases.
+
+
+# Question 2
+
+```{r}
+#| message: false
+
+# load data
+hbp3456 <- read_csv("/Users/mtjen/Desktop/432/labs/lab02/hbp3456.csv") |>
+  clean_names()
+
+# convert "No" and "Yes" values to 0 and 1
+hbp3456 <- hbp3456 |>
+  mutate(statin = case_when(statin == "No" ~ 0, TRUE ~ 1))
+
+# filter practices
+hbp3456 <- hbp3456 |>
+  filter(practice == "Center" | 
+           practice == "Elm" | 
+           practice == "Plympton" | 
+           practice == "Walnut")
+
+# filter complete cases for ldl and statin
+hbp3456 <- hbp3456 |> 
+  filter(complete.cases(ldl)) |>
+  filter(complete.cases(statin))
+
+# check dimensions
+dim(hbp3456)
+
+# create logistic regression models
+
+# no interaction term
+model_no_int <- glm(statin ~ practice + ldl + rcs(age, 4), 
+                    data = hbp3456, family = binomial(link = "logit"))
+
+# with interaction term
+model_with_int <- glm(statin ~ practice + ldl + rcs(age, 4) + practice %ia% ldl, 
+                    data = hbp3456, family = binomial(link = "logit"))
+
+# display coefficients
+coef(model_no_int)
+coef(model_with_int)
+```
+
+Here, we load some new data and appropriately filter it so that we can build our two models. Once we have each of our models, we display the raw (logit) coefficient values for each model.
+
+
+# Question 3
+
+```{r}
+# get confidence interval
+tidy(model_no_int, exponentiate = TRUE, conf.int = TRUE, conf.level = 0.90) |>
+  select(term, estimate, conf.low, conf.high) |>
+  filter(term == "ldl")
+```
+
+The odds ratio associated with `ldl` is 0.993 with a 90% confidence interval of (0.990, 0.995).
+This means that the odds of someone having a statin prescription is 0.993 times as likely when `ldl` is increased by one unit and all other variables are held constant. The effect direction can be confirmed with 90% confidence, as the entire confidence interval is below 1.
+
+```{r}
+# create data to predict statin prescription odds
+predictVals = tibble::tibble(practice = c("Elm", "Elm"),
+                             ldl = c(142, 85),
+                             age = c(40, 40))
+
+# make predictions
+values <- predict(model_no_int, newdata = predictVals)
+harryValRaw <- values[1]
+sallyValRaw <- values[2]
+
+# get exponentiated values
+harryVal <- exp(harryValRaw)
+sallyVal <- exp(sallyValRaw)
+
+harryVal
+sallyVal
+
+# get odds ratio
+harryVal/sallyVal
+```
+
+Looking at the main effect of `ldl` helps to describe this, using cases of Harry (75 percentile, `ldl` = 142) and Sally (25 percentile`ldl` = 85). We will predict each of their chances of having a statin prescription given that they attend the same practice and are the same age. Through this, Harry's predicted odds of having a prescription is 0.461 while Sally's is 0.691. This shows that the main effect of `ldl` is 0.667, so if someone's `ldl` changes from the 25th to 75th percentile and all other variables are held constant, then the odds of them having a statin prescription at the 75th percentile is 0.667 times as likely as if they were in the 25th percentile.
+
+
+# Question 4
+
+```{r}
+# get confidence intervals
+tidy(model_with_int, exponentiate = TRUE, conf.int = TRUE, conf.level = 0.90) |>
+  select(term, estimate, conf.low, conf.high) |>
+  filter(term == "ldl" |
+           term == "practice %ia% ldlpractice=Elm * ldl" |
+           term == "practice %ia% ldlpractice=Plympton * ldl" |
+           term == "practice %ia% ldlpractice=Walnut * ldl")
+```
+
+The first odds ratio we will look at is just for the `ldl` variable, where the ratio is 0.991. This means that the odds of someone having a statin prescription is 0.991 times as likely when `ldl` is increased by one unit and all other variables are held constant. We can also see the odds ratios of `ldl` by `practice` since we have an interaction term between `ldl` and `practice`, with the baseline `practice` of "Center". For a patient at "Elm", the odds ratio is 0.989, which means that they are 0.989 times as likely to have a statin prescription as a patient at "Center" when `ldl` is increased by one unit and all other variables are held constant. For a patient at "Plympton", the odds ratio is 1.000, which means that they are 1.000 times as likely to have a statin prescription as a patient at "Center" when `ldl` is increased by one unit and all other variables are held constant. However, the 90% confidence interval includes 1, which means that we can't be fully sure about the true effect direction. For a patient at "Walnut", the odds ratio is 1.010, which means that they are 1.010 times as likely to have a statin prescription as a patient at "Center" when `ldl` is increased by one unit and all other variables are held constant. 
+
+```{r}
+# create data to predict statin prescription odds
+predictValsInt = tibble::tibble(practice = c("Center", "Center", 
+                                          "Elm", "Elm", 
+                                          "Plympton", "Plympton", 
+                                          "Walnut", "Walnut"),
+                             ldl = c(142, 85,
+                                     142, 85,
+                                     142, 85,
+                                     142, 85),
+                             age = c(40, 40,
+                                     40, 40,
+                                     40, 40,
+                                     40, 40))
+
+# make predictions
+valuesInt <- predict(model_with_int, newdata = predictValsInt)
+
+# get exponentiated values
+expValsInt <- c()
+
+for (val in valuesInt) {
+  expVal = exp(val)
+  expValsInt <- append(expValsInt, expVal)
+}
+
+# add predicted exponentiated values to table
+predictValsInt$prediction <- expValsInt
+
+predictValsInt
+```
+
+Using cases of Harry (75 percentile, `ldl` = 142) and Sally (25 percentile`ldl` = 85), we can get practice-specific odds ratios to how changes in `ldl` impacts the model's prediction of statin by `practice`. 
+
+```{r}
+# calculate practice specific odds
+centerOdds <- expValsInt[1] / expValsInt[2]
+elmOdds <- expValsInt[3] / expValsInt[4]
+plymptonOdds <- expValsInt[5] / expValsInt[6]
+walnutOdds <- expValsInt[7] / expValsInt[8]
+
+centerOdds
+elmOdds
+plymptonOdds
+walnutOdds
+```
+
+By calculating these practice-specific odds ratios, we can see the main effect of `ldl` changing from the 25th to 75th percentile for patients in each `practice.` For "Center", the odds ratio is 0.585, so if someone's `ldl` changes from the 25th to 75th percentile and all other variables are held constant, the odds of them having a statin prescription at the 75th percentile is 0.585 times as likely as if they were in the 25th percentile. For "Elm", the odds ratio is 0.310, so if someone's `ldl` changes from the 25th to 75th percentile and all other variables are held constant, the odds of them having a statin prescription at the 75th percentile is 0.310 times as likely as if they were in the 25th percentile. For "Plympton", the odds ratio is 0.773, so if someone's `ldl` changes from the 25th to 75th percentile and all other variables are held constant, the odds of them having a statin prescription at the 75th percentile is 0.773 times as likely as if they were in the 25th percentile. For "Walnut", the odds ratio is 1.225, so if someone's `ldl` changes from the 25th to 75th percentile and all other variables are held constant, the odds of them having a statin prescription at the 75th percentile is 1.225 times as likely as if they were in the 25th percentile. 
+
+
+# Question 5
+
+```{r}
+# new models using lrm so we can validate
+dist <- datadist(hbp3456)
+options(datadist = "dist")
+
+# no interaction term
+model_no_int_lrm <- lrm(statin ~ practice + ldl + rcs(age, 4), 
+                        data = hbp3456, x = TRUE, y = TRUE)
+
+# with interaction term
+model_with_int_lrm <- lrm(statin ~ practice + ldl + rcs(age, 4) + practice %ia% ldl, 
+                        data = hbp3456, x = TRUE, y = TRUE)
+
+# set seed for replication
+set.seed(2023)
+
+# validate models
+validated_without <- validate(model_no_int_lrm)
+validated_with <- validate(model_with_int_lrm)
+
+validated_without
+validated_with
+```
+
+To compare the effectiveness of the models with and without an interaction term, we will get bootstrap validated C statistic and Nagelkerke $R^2$ values. To calculate the validated C statistic, we have to get the validated Dxy value and divide it by 2 and then add 0.5. For the model without an interaction term, $C_{without}$ = 0.5 + (0.4164/2) = 0.7082 and Nagelkerke $R^2$ = 0.1593. For the model with an interaction term, $C_{with}$ = 0.5 + (0.4413/2) = 0.7207 and Nagelkerke $R^2$ = 0.1856. Using these two fit quality assessments, we can see that the model with an interaction term performs better in terms of both the C statistic and Nagelkerke $R^2$, as it has higher values for both measures of quality of fit.
+
+
+# Session Information
+
+```{r}
+xfun::session_info()
+```
